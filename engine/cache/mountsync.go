@@ -14,9 +14,8 @@ import (
 	"github.com/containerd/containerd/archive"
 	"github.com/containerd/containerd/content"
 	"github.com/containerd/containerd/diff/apply"
-	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/mount"
-	"github.com/dagger/dagger/core"
+	"github.com/containerd/errdefs"
 	"github.com/klauspost/compress/zstd"
 	"github.com/moby/buildkit/solver/llbsolver/mounts"
 	solverpb "github.com/moby/buildkit/solver/pb"
@@ -24,6 +23,8 @@ import (
 	"github.com/moby/buildkit/util/leaseutil"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/dagger/dagger/core"
 )
 
 func (m *manager) StartCacheMountSynchronization(ctx context.Context) error {
@@ -33,13 +34,8 @@ func (m *manager) StartCacheMountSynchronization(ctx context.Context) error {
 	}
 	syncedCacheMounts := getCacheMountConfigResp.SyncedCacheMounts
 
-	if len(syncedCacheMounts) == 0 {
-		return nil
-	}
-
 	var eg errgroup.Group
 	for _, syncedCacheMount := range syncedCacheMounts {
-		syncedCacheMount := syncedCacheMount
 		if syncedCacheMount.URL == "" {
 			// nothing to download, have to start fresh, skip it until we sync back to cloud at shutdown
 			continue
@@ -91,11 +87,17 @@ func (m *manager) StartCacheMountSynchronization(ctx context.Context) error {
 
 	m.stopCacheMountSync = func(ctx context.Context) error {
 		var eg errgroup.Group
-		for _, syncedCacheMount := range syncedCacheMounts {
-			syncedCacheMount := syncedCacheMount
+
+		seenCacheMounts := map[string]struct{}{}
+		core.SeenCacheKeys.Range(func(k any, v any) bool {
+			seenCacheMounts[k.(string)] = struct{}{}
+			return true
+		})
+
+		for cacheMountName := range seenCacheMounts {
 			eg.Go(func() error {
-				bklog.G(ctx).Debugf("syncing cache mount remotely %s", syncedCacheMount.Name)
-				cacheKey := cacheKeyFromMountName(syncedCacheMount.Name)
+				bklog.G(ctx).Debugf("syncing cache mount remotely %s", cacheMountName)
+				cacheKey := cacheKeyFromMountName(cacheMountName)
 
 				return withCacheMount(ctx, m.MountManager, cacheKey, func(ctx context.Context, mnt mount.Mount) error {
 					// First compress the mount into the content store. We can't stream direct to S3 because we want
@@ -111,7 +113,7 @@ func (m *manager) StartCacheMountSynchronization(ctx context.Context) error {
 					defer done(ctx)
 
 					// compress the mount to a tar.zstd and write to the content store
-					contentRef := "dagger-cachemount-" + syncedCacheMount.Name
+					contentRef := "dagger-cachemount-" + cacheMountName
 					contentWriter, err := m.Worker.ContentStore().Writer(ctx, content.WithRef(contentRef))
 					if err != nil {
 						return fmt.Errorf("failed to create content writer: %w", err)
@@ -135,7 +137,7 @@ func (m *manager) StartCacheMountSynchronization(ctx context.Context) error {
 					if err := contentWriter.Commit(ctx, 0, ""); err != nil {
 						if errors.Is(err, errdefs.ErrAlreadyExists) {
 							// we should be releasing these, but if it was already there, that's weird but fine
-							bklog.G(ctx).Debugf("cache mount %q already committed", syncedCacheMount.Name)
+							bklog.G(ctx).Debugf("cache mount %q already committed", cacheMountName)
 						} else {
 							return fmt.Errorf("failed to commit content: %w", err)
 						}
@@ -152,13 +154,19 @@ func (m *manager) StartCacheMountSynchronization(ctx context.Context) error {
 					defer contentReaderAt.Close()
 					contentLength := contentReaderAt.Size()
 					getURLResp, err := m.cacheClient.GetCacheMountUploadURL(ctx, GetCacheMountUploadURLRequest{
-						CacheName: syncedCacheMount.Name,
+						CacheName: cacheMountName,
 						Digest:    contentDigest,
 						Size:      contentLength,
 					})
 					if err != nil {
 						return fmt.Errorf("failed to get cache mount upload url: %w", err)
 					}
+
+					if getURLResp.Skip {
+						bklog.G(ctx).Debugf("skipped pushing cache mount %s", cacheMountName)
+						return nil
+					}
+
 					contentReader := io.NewSectionReader(contentReaderAt, 0, contentLength)
 					httpReq, err := http.NewRequestWithContext(ctx, http.MethodPut, getURLResp.URL, contentReader)
 					if err != nil {
@@ -177,7 +185,7 @@ func (m *manager) StartCacheMountSynchronization(ctx context.Context) error {
 						return fmt.Errorf("failed to upload cache mount: %s", resp.Status)
 					}
 
-					bklog.G(ctx).Debugf("synced cache mount remotely %s", syncedCacheMount.Name)
+					bklog.G(ctx).Debugf("synced cache mount remotely %s", cacheMountName)
 					return nil
 				})
 			})

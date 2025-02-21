@@ -6,114 +6,100 @@ import (
 	"io/fs"
 	"path"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"time"
 
-	"github.com/dagger/dagger/core/pipeline"
-	"github.com/dagger/dagger/router"
-	bkclient "github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/client/llb"
 	bkgw "github.com/moby/buildkit/frontend/gateway/client"
 	"github.com/moby/buildkit/solver/pb"
-	"github.com/opencontainers/go-digest"
-	specs "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/moby/patternmatcher"
 	"github.com/pkg/errors"
 	fstypes "github.com/tonistiigi/fsutil/types"
+	"github.com/vektah/gqlparser/v2/ast"
+
+	"dagger.io/dagger/telemetry"
+	"github.com/dagger/dagger/engine/buildkit"
 )
 
 // Directory is a content-addressed directory.
 type Directory struct {
-	LLB      *pb.Definition `json:"llb"`
-	Dir      string         `json:"dir"`
-	Platform specs.Platform `json:"platform"`
-	Pipeline pipeline.Path  `json:"pipeline"`
+	Query *Query
+
+	LLB      *pb.Definition
+	Dir      string
+	Platform Platform
 
 	// Services necessary to provision the directory.
-	Services ServiceBindings `json:"services,omitempty"`
+	Services ServiceBindings
 }
 
-func NewDirectory(ctx context.Context, def *pb.Definition, dir string, pipeline pipeline.Path, platform specs.Platform, services ServiceBindings) *Directory {
+func (*Directory) Type() *ast.Type {
+	return &ast.Type{
+		NamedType: "Directory",
+		NonNull:   true,
+	}
+}
+
+func (*Directory) TypeDescription() string {
+	return "A directory."
+}
+
+var _ HasPBDefinitions = (*Directory)(nil)
+
+func (dir *Directory) PBDefinitions(ctx context.Context) ([]*pb.Definition, error) {
+	var defs []*pb.Definition
+	if dir.LLB != nil {
+		defs = append(defs, dir.LLB)
+	}
+	for _, bnd := range dir.Services {
+		ctr := bnd.Service.Container
+		if ctr == nil {
+			continue
+		}
+		ctrDefs, err := ctr.PBDefinitions(ctx)
+		if err != nil {
+			return nil, err
+		}
+		defs = append(defs, ctrDefs...)
+	}
+	return defs, nil
+}
+
+func NewDirectory(query *Query, def *pb.Definition, dir string, platform Platform, services ServiceBindings) *Directory {
+	if query == nil {
+		panic("query must be non-nil")
+	}
 	return &Directory{
+		Query:    query,
 		LLB:      def,
 		Dir:      dir,
 		Platform: platform,
-		Pipeline: pipeline.Copy(),
 		Services: services,
 	}
 }
 
-func NewDirectorySt(ctx context.Context, st llb.State, dir string, pipeline pipeline.Path, platform specs.Platform, services ServiceBindings) (*Directory, error) {
-	def, err := st.Marshal(ctx, llb.Platform(platform))
+func NewScratchDirectory(ctx context.Context, query *Query, platform Platform) (*Directory, error) {
+	return NewDirectorySt(ctx, query, llb.Scratch(), "/", platform, nil)
+}
+
+func NewDirectorySt(ctx context.Context, query *Query, st llb.State, dir string, platform Platform, services ServiceBindings) (*Directory, error) {
+	if query == nil {
+		panic("query must be non-nil")
+	}
+	def, err := st.Marshal(ctx, llb.Platform(platform.Spec()))
 	if err != nil {
 		return nil, err
 	}
 
-	return NewDirectory(ctx, def.ToPB(), dir, pipeline, platform, services), nil
+	return NewDirectory(query, def.ToPB(), dir, platform, services), nil
 }
 
 // Clone returns a deep copy of the container suitable for modifying in a
 // WithXXX method.
 func (dir *Directory) Clone() *Directory {
 	cp := *dir
-	cp.Pipeline = cloneSlice(cp.Pipeline)
-	cp.Services = cloneMap(cp.Services)
+	cp.Services = cloneSlice(cp.Services)
 	return &cp
-}
-
-// DirectoryID is an opaque value representing a content-addressed directory.
-type DirectoryID string
-
-func (id DirectoryID) String() string {
-	return string(id)
-}
-
-// DirectoryID is digestible so that smaller hashes can be displayed in
-// --debug vertex names.
-var _ router.Digestible = DirectoryID("")
-
-func (id DirectoryID) Digest() (digest.Digest, error) {
-	return digest.FromString(id.String()), nil
-}
-
-// ToDirectory converts the ID into a real Directory.
-func (id DirectoryID) ToDirectory() (*Directory, error) {
-	var dir Directory
-
-	if id == "" {
-		return &dir, nil
-	}
-
-	if err := decodeID(&dir, id); err != nil {
-		return nil, err
-	}
-
-	return &dir, nil
-}
-
-// ID marshals the directory into a content-addressed ID.
-func (dir *Directory) ID() (DirectoryID, error) {
-	return encodeID[DirectoryID](dir)
-}
-
-var _ router.Pipelineable = (*Directory)(nil)
-
-func (dir *Directory) PipelinePath() pipeline.Path {
-	// TODO(vito): test
-	return dir.Pipeline
-}
-
-// Directory is digestible so that it can be recorded as an output of the
-// --debug vertex that created it.
-var _ router.Digestible = (*Directory)(nil)
-
-// Digest returns the directory's content hash.
-func (dir *Directory) Digest() (digest.Digest, error) {
-	id, err := dir.ID()
-	if err != nil {
-		return "", err
-	}
-	return id.Digest()
 }
 
 func (dir *Directory) State() (llb.State, error) {
@@ -142,96 +128,223 @@ func (dir *Directory) StateWithSourcePath() (llb.State, error) {
 }
 
 func (dir *Directory) SetState(ctx context.Context, st llb.State) error {
-	def, err := st.Marshal(ctx, llb.Platform(dir.Platform))
+	def, err := st.Marshal(ctx,
+		llb.Platform(dir.Platform.Spec()),
+		buildkit.WithTracePropagation(ctx),
+		buildkit.WithPassthrough(), // these spans aren't particularly interesting
+	)
 	if err != nil {
-		return nil
+		return err
 	}
 
 	dir.LLB = def.ToPB()
 	return nil
 }
 
-func (dir *Directory) WithPipeline(ctx context.Context, name, description string, labels []pipeline.Label) (*Directory, error) {
+func (dir *Directory) WithPipeline(ctx context.Context, name, description string) (*Directory, error) {
 	dir = dir.Clone()
-	dir.Pipeline = dir.Pipeline.Add(pipeline.Pipeline{
-		Name:        name,
-		Description: description,
-		Labels:      labels,
-	})
+	dir.Query = dir.Query.WithPipeline(name, description)
 	return dir, nil
 }
 
-func (dir *Directory) Stat(ctx context.Context, gw bkgw.Client, src string) (*fstypes.Stat, error) {
-	src = path.Join(dir.Dir, src)
+func (dir *Directory) Evaluate(ctx context.Context) (*buildkit.Result, error) {
+	if dir.LLB == nil {
+		return nil, nil
+	}
 
-	return WithServices(ctx, gw, dir.Services, func() (*fstypes.Stat, error) {
-		res, err := gw.Solve(ctx, bkgw.SolveRequest{
-			Definition: dir.LLB,
-		})
-		if err != nil {
-			return nil, err
-		}
+	svcs, err := dir.Query.Services(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get services: %w", err)
+	}
+	bk, err := dir.Query.Buildkit(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get buildkit client: %w", err)
+	}
 
-		ref, err := res.SingleRef()
-		if err != nil {
-			return nil, err
-		}
-		// empty directory, i.e. llb.Scratch()
-		if ref == nil {
-			if clean := path.Clean(src); clean == "." || clean == "/" {
-				// fake out a reasonable response
-				return &fstypes.Stat{
-					Path: src,
-					Mode: uint32(fs.ModeDir),
-				}, nil
-			}
+	detach, _, err := svcs.StartBindings(ctx, dir.Services)
+	if err != nil {
+		return nil, err
+	}
+	defer detach()
 
-			return nil, fmt.Errorf("%s: no such file or directory", src)
-		}
-
-		return ref.StatFile(ctx, bkgw.StatRequest{
-			Path: src,
-		})
+	return bk.Solve(ctx, bkgw.SolveRequest{
+		Evaluate:   true,
+		Definition: dir.LLB,
 	})
 }
 
-func (dir *Directory) Entries(ctx context.Context, gw bkgw.Client, src string) ([]string, error) {
+func (dir *Directory) Digest(ctx context.Context) (string, error) {
+	result, err := dir.Evaluate(ctx)
+	if err != nil {
+		return "", fmt.Errorf("failed to evaluate directory: %w", err)
+	}
+	if result == nil {
+		return "", fmt.Errorf("failed to evaluate null directory")
+	}
+
+	digest, err := result.Ref.Digest(ctx, dir.Dir)
+	if err != nil {
+		return "", fmt.Errorf("failed to compute digest: %w", err)
+	}
+
+	return digest.String(), nil
+}
+
+func (dir *Directory) Stat(ctx context.Context, bk *buildkit.Client, svcs *Services, src string) (*fstypes.Stat, error) {
 	src = path.Join(dir.Dir, src)
 
-	return WithServices(ctx, gw, dir.Services, func() ([]string, error) {
-		res, err := gw.Solve(ctx, bkgw.SolveRequest{
-			Definition: dir.LLB,
-		})
-		if err != nil {
-			return nil, err
-		}
+	detach, _, err := svcs.StartBindings(ctx, dir.Services)
+	if err != nil {
+		return nil, err
+	}
+	defer detach()
 
-		ref, err := res.SingleRef()
-		if err != nil {
-			return nil, err
-		}
-		// empty directory, i.e. llb.Scratch()
-		if ref == nil {
-			if clean := path.Clean(src); clean == "." || clean == "/" {
-				return []string{}, nil
-			}
-			return nil, fmt.Errorf("%s: no such file or directory", src)
-		}
-
-		entries, err := ref.ReadDir(ctx, bkgw.ReadDirRequest{
-			Path: src,
-		})
-		if err != nil {
-			return nil, err
-		}
-
-		paths := []string{}
-		for _, entry := range entries {
-			paths = append(paths, entry.GetPath())
-		}
-
-		return paths, nil
+	res, err := bk.Solve(ctx, bkgw.SolveRequest{
+		Definition: dir.LLB,
 	})
+	if err != nil {
+		return nil, err
+	}
+
+	ref, err := res.SingleRef()
+	if err != nil {
+		return nil, err
+	}
+	// empty directory, i.e. llb.Scratch()
+	if ref == nil {
+		if clean := path.Clean(src); clean == "." || clean == "/" {
+			// fake out a reasonable response
+			return &fstypes.Stat{
+				Path: src,
+				Mode: uint32(fs.ModeDir),
+			}, nil
+		}
+
+		return nil, fmt.Errorf("%s: no such file or directory", src)
+	}
+
+	return ref.StatFile(ctx, bkgw.StatRequest{
+		Path: src,
+	})
+}
+
+func (dir *Directory) Entries(ctx context.Context, src string) ([]string, error) {
+	src = path.Join(dir.Dir, src)
+
+	svcs, err := dir.Query.Services(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get services: %w", err)
+	}
+	bk, err := dir.Query.Buildkit(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get buildkit client: %w", err)
+	}
+
+	detach, _, err := svcs.StartBindings(ctx, dir.Services)
+	if err != nil {
+		return nil, err
+	}
+	defer detach()
+
+	res, err := bk.Solve(ctx, bkgw.SolveRequest{
+		Definition: dir.LLB,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	ref, err := res.SingleRef()
+	if err != nil {
+		return nil, err
+	}
+	// empty directory, i.e. llb.Scratch()
+	if ref == nil {
+		if clean := path.Clean(src); clean == "." || clean == "/" {
+			return []string{}, nil
+		}
+		return nil, fmt.Errorf("%s: no such file or directory", src)
+	}
+
+	entries, err := ref.ReadDir(ctx, bkgw.ReadDirRequest{
+		Path: src,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	paths := []string{}
+	for _, entry := range entries {
+		paths = append(paths, entry.GetPath())
+	}
+
+	return paths, nil
+}
+
+// Glob returns a list of files that matches the given pattern.
+func (dir *Directory) Glob(ctx context.Context, pattern string) ([]string, error) {
+	svcs, err := dir.Query.Services(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get services: %w", err)
+	}
+	bk, err := dir.Query.Buildkit(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get buildkit client: %w", err)
+	}
+
+	detach, _, err := svcs.StartBindings(ctx, dir.Services)
+	if err != nil {
+		return nil, err
+	}
+	defer detach()
+
+	res, err := bk.Solve(ctx, bkgw.SolveRequest{
+		Definition: dir.LLB,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	ref, err := res.SingleRef()
+	if err != nil {
+		return nil, err
+	}
+	// empty directory, i.e. llb.Scratch()
+	if ref == nil {
+		return []string{}, nil
+	}
+
+	// We use the same pattern matching function as Buildkit, since just doing
+	// IncludePatterns will still include directories we don't want
+	pm, err := patternmatcher.New([]string{pattern})
+	if err != nil {
+		return nil, err
+	}
+
+	var paths []string
+	err = ref.WalkDir(ctx, buildkit.WalkDirRequest{
+		IncludePattern: pattern,
+		Path:           dir.Dir,
+		Callback: func(path string, info *fstypes.Stat) error {
+			// HACK: ideally, we'd have something like MatchesExact, which
+			// would skip the parent behavior that we don't really want here -
+			// oh well, let's just fake it with false
+			//nolint:staticcheck
+			match, err := pm.MatchesUsingParentResult(filepath.Clean(path), false)
+			if err != nil {
+				return err
+			}
+			if match {
+				paths = append(paths, path)
+			}
+
+			return nil
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return paths, nil
 }
 
 func (dir *Directory) WithNewFile(ctx context.Context, dest string, content []byte, permissions fs.FileMode, ownership *Ownership) (*Directory, error) {
@@ -256,7 +369,7 @@ func (dir *Directory) WithNewFile(ctx context.Context, dest string, content []by
 
 	parent, _ := path.Split(dest)
 	if parent != "" {
-		st = st.File(llb.Mkdir(parent, 0755, llb.WithParents(true)), dir.Pipeline.LLBOpt())
+		st = st.File(llb.Mkdir(parent, 0755, llb.WithParents(true)))
 	}
 
 	opts := []llb.MkfileOption{}
@@ -264,10 +377,7 @@ func (dir *Directory) WithNewFile(ctx context.Context, dest string, content []by
 		opts = append(opts, ownership.Opt())
 	}
 
-	st = st.File(
-		llb.Mkfile(dest, permissions, content, opts...),
-		dir.Pipeline.LLBOpt(),
-	)
+	st = st.File(llb.Mkfile(dest, permissions, content, opts...))
 
 	err = dir.SetState(ctx, st)
 	if err != nil {
@@ -279,29 +389,76 @@ func (dir *Directory) WithNewFile(ctx context.Context, dest string, content []by
 
 func (dir *Directory) Directory(ctx context.Context, subdir string) (*Directory, error) {
 	dir = dir.Clone()
-	dir.Dir = path.Join(dir.Dir, subdir)
-	return dir, nil
-}
 
-func (dir *Directory) File(ctx context.Context, file string) (*File, error) {
-	err := validateFileName(file)
+	svcs, err := dir.Query.Services(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get services: %w", err)
+	}
+	bk, err := dir.Query.Buildkit(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get buildkit client: %w", err)
+	}
+
+	dir.Dir = path.Join(dir.Dir, subdir)
+
+	// check that the directory actually exists so the user gets an error earlier
+	// rather than when the dir is used
+	info, err := dir.Stat(ctx, bk, svcs, ".")
 	if err != nil {
 		return nil, err
 	}
 
+	if !info.IsDir() {
+		return nil, fmt.Errorf("path %s is a file, not a directory", subdir)
+	}
+
+	return dir, nil
+}
+
+func (dir *Directory) File(ctx context.Context, file string) (*File, error) {
+	svcs, err := dir.Query.Services(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get services: %w", err)
+	}
+	bk, err := dir.Query.Buildkit(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get buildkit client: %w", err)
+	}
+
+	err = validateFileName(file)
+	if err != nil {
+		return nil, err
+	}
+
+	// check that the file actually exists so the user gets an error earlier
+	// rather than when the file is used
+	info, err := dir.Stat(ctx, bk, svcs, file)
+	if err != nil {
+		return nil, err
+	}
+
+	if info.IsDir() {
+		return nil, fmt.Errorf("path %s is a directory, not a file", file)
+	}
+
 	return &File{
+		Query:    dir.Query,
 		LLB:      dir.LLB,
 		File:     path.Join(dir.Dir, file),
-		Pipeline: dir.Pipeline,
 		Platform: dir.Platform,
 		Services: dir.Services,
 	}, nil
 }
 
-func (dir *Directory) WithDirectory(ctx context.Context, subdir string, src *Directory, filter CopyFilter, owner *Ownership) (*Directory, error) {
+type CopyFilter struct {
+	Exclude []string `default:"[]"`
+	Include []string `default:"[]"`
+}
+
+func (dir *Directory) WithDirectory(ctx context.Context, destDir string, src *Directory, filter CopyFilter, owner *Ownership) (*Directory, error) {
 	dir = dir.Clone()
 
-	st, err := dir.State()
+	destSt, err := dir.State()
 	if err != nil {
 		return nil, err
 	}
@@ -311,31 +468,154 @@ func (dir *Directory) WithDirectory(ctx context.Context, subdir string, src *Dir
 		return nil, err
 	}
 
-	opts := []llb.CopyOption{
-		&llb.CopyInfo{
-			CreateDestPath:      true,
-			CopyDirContentsOnly: true,
-			IncludePatterns:     filter.Include,
-			ExcludePatterns:     filter.Exclude,
-		},
-	}
-	if owner != nil {
-		opts = append(opts, owner.Opt())
-	}
-
-	st = st.File(
-		llb.Copy(srcSt, src.Dir, path.Join(dir.Dir, subdir), opts...),
-		dir.Pipeline.LLBOpt(),
-	)
-
-	err = dir.SetState(ctx, st)
-	if err != nil {
+	if err := dir.SetState(ctx, mergeStates(mergeStateInput{
+		Dest:            destSt,
+		DestDir:         path.Join(dir.Dir, destDir),
+		Src:             srcSt,
+		SrcDir:          src.Dir,
+		IncludePatterns: filter.Include,
+		ExcludePatterns: filter.Exclude,
+		Owner:           owner,
+	})); err != nil {
 		return nil, err
 	}
 
 	dir.Services.Merge(src.Services)
 
 	return dir, nil
+}
+
+func (dir *Directory) WithFile(
+	ctx context.Context,
+	destPath string,
+	src *File,
+	permissions *int,
+	owner *Ownership,
+) (*Directory, error) {
+	dir = dir.Clone()
+
+	destSt, err := dir.State()
+	if err != nil {
+		return nil, err
+	}
+
+	srcSt, err := src.State()
+	if err != nil {
+		return nil, err
+	}
+
+	if err := dir.SetState(ctx, mergeStates(mergeStateInput{
+		Dest:         destSt,
+		DestDir:      path.Join(dir.Dir, path.Dir(destPath)),
+		DestFileName: path.Base(destPath),
+		Src:          srcSt,
+		SrcDir:       path.Dir(src.File),
+		SrcFileName:  path.Base(src.File),
+		Permissions:  permissions,
+		Owner:        owner,
+	})); err != nil {
+		return nil, err
+	}
+
+	dir.Services.Merge(src.Services)
+
+	return dir, nil
+}
+
+// TODO: address https://github.com/dagger/dagger/pull/6556/files#r1482830091
+func (dir *Directory) WithFiles(
+	ctx context.Context,
+	destDir string,
+	src []*File,
+	permissions *int,
+	owner *Ownership,
+) (*Directory, error) {
+	dir = dir.Clone()
+
+	var err error
+	for _, file := range src {
+		dir, err = dir.WithFile(
+			ctx,
+			path.Join(destDir, path.Base(file.File)),
+			file,
+			permissions,
+			owner,
+		)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return dir, nil
+}
+
+type mergeStateInput struct {
+	Dest         llb.State
+	DestDir      string
+	DestFileName string
+
+	Src         llb.State
+	SrcDir      string
+	SrcFileName string
+
+	IncludePatterns []string
+	ExcludePatterns []string
+
+	Permissions *int
+	Owner       *Ownership
+}
+
+func mergeStates(input mergeStateInput) llb.State {
+	input.DestDir = path.Join("/", input.DestDir)
+	input.SrcDir = path.Join("/", input.SrcDir)
+
+	copyInfo := &llb.CopyInfo{
+		CreateDestPath:      true,
+		CopyDirContentsOnly: true,
+		IncludePatterns:     input.IncludePatterns,
+		ExcludePatterns:     input.ExcludePatterns,
+	}
+	if input.DestFileName == "" && input.SrcFileName != "" {
+		input.DestFileName = input.SrcFileName
+	}
+	if input.Permissions != nil {
+		fm := fs.FileMode(*input.Permissions)
+		copyInfo.Mode = &fm
+	}
+	if input.Owner != nil {
+		input.Owner.Opt().SetCopyOption(copyInfo)
+	}
+
+	// MergeOp currently only supports merging the "/" of states together without any
+	// modifications or filtering
+	canDoDirectMerge := copyInfo.Mode == nil &&
+		copyInfo.ChownOpt == nil &&
+		len(copyInfo.ExcludePatterns) == 0 &&
+		len(copyInfo.IncludePatterns) == 0 &&
+		input.DestDir == "/" &&
+		input.SrcDir == "/" &&
+		// TODO:(sipsma) we could support direct merge-op with individual files if we can verify
+		// there are no other files in the dir, but doing so by just calling ReadDir would result
+		// in unlazying the inputs, which defeats some of the performance benefits of merge-op.
+		input.DestFileName == "" &&
+		input.SrcFileName == ""
+
+	mergeStates := []llb.State{input.Dest}
+	if canDoDirectMerge {
+		// Directly merge the states together, which is lazy, uses hardlinks instead of
+		// copies and caches inputs individually instead of invalidating the whole
+		// chain following any modified input.
+		mergeStates = append(mergeStates, input.Src)
+	} else {
+		// Even if we can't merge directly, we can still get some optimization by
+		// copying to scratch and then merging that. This still results in an on-disk
+		// copy but preserves the other caching benefits of MergeOp. This is the same
+		// behavior as "COPY --link" in Dockerfiles.
+		mergeStates = append(mergeStates, llb.Scratch().File(llb.Copy(
+			input.Src, path.Join(input.SrcDir, input.SrcFileName), path.Join(input.DestDir, input.DestFileName), copyInfo,
+		)))
+	}
+	return llb.Merge(mergeStates)
 }
 
 func (dir *Directory) WithTimestamps(ctx context.Context, unix int) (*Directory, error) {
@@ -352,7 +632,6 @@ func (dir *Directory) WithTimestamps(ctx context.Context, unix int) (*Directory,
 			CopyDirContentsOnly: true,
 			CreatedTime:         &t,
 		}),
-		dir.Pipeline.LLBOpt(),
 	)
 
 	err = dir.SetState(ctx, st)
@@ -385,7 +664,7 @@ func (dir *Directory) WithNewDirectory(ctx context.Context, dest string, permiss
 		permissions = 0755
 	}
 
-	st = st.File(llb.Mkdir(dest, permissions, llb.WithParents(true)), dir.Pipeline.LLBOpt())
+	st = st.File(llb.Mkdir(dest, permissions, llb.WithParents(true)))
 
 	err = dir.SetState(ctx, st)
 	if err != nil {
@@ -393,87 +672,22 @@ func (dir *Directory) WithNewDirectory(ctx context.Context, dest string, permiss
 	}
 
 	return dir, nil
-}
-
-func (dir *Directory) WithFile(ctx context.Context, subdir string, src *File, permissions fs.FileMode, ownership *Ownership) (*Directory, error) {
-	dir = dir.Clone()
-
-	st, err := dir.State()
-	if err != nil {
-		return nil, err
-	}
-
-	srcSt, err := src.State()
-	if err != nil {
-		return nil, err
-	}
-
-	var perm *fs.FileMode
-	if permissions != 0 {
-		perm = &permissions
-	}
-
-	opts := []llb.CopyOption{
-		&llb.CopyInfo{
-			CreateDestPath: true,
-			Mode:           perm,
-		},
-	}
-
-	if ownership != nil {
-		opts = append(opts, ownership.Opt())
-	}
-
-	st = st.File(
-		llb.Copy(srcSt, src.File, path.Join(dir.Dir, subdir), opts...),
-		dir.Pipeline.LLBOpt(),
-	)
-
-	err = dir.SetState(ctx, st)
-	if err != nil {
-		return nil, err
-	}
-
-	dir.Services.Merge(src.Services)
-
-	return dir, nil
-}
-
-func MergeDirectories(ctx context.Context, dirs []*Directory, platform specs.Platform) (*Directory, error) {
-	states := make([]llb.State, 0, len(dirs))
-	var pipeline pipeline.Path
-	for _, dir := range dirs {
-		if !reflect.DeepEqual(platform, dir.Platform) {
-			// TODO(vito): work around with llb.Copy shenanigans?
-			return nil, fmt.Errorf("TODO: cannot merge across platforms: %+v != %+v", platform, dir.Platform)
-		}
-
-		if pipeline.Name() == "" {
-			pipeline = dir.Pipeline
-		}
-
-		state, err := dir.State()
-		if err != nil {
-			return nil, err
-		}
-
-		states = append(states, state)
-	}
-
-	return NewDirectorySt(ctx, llb.Merge(states, pipeline.LLBOpt()), "", pipeline, platform, nil)
 }
 
 func (dir *Directory) Diff(ctx context.Context, other *Directory) (*Directory, error) {
 	dir = dir.Clone()
 
-	if dir.Dir != other.Dir {
-		// TODO(vito): work around with llb.Copy shenanigans?
-		return nil, fmt.Errorf("TODO: cannot diff with different relative paths: %q != %q", dir.Dir, other.Dir)
+	thisDirPath := dir.Dir
+	if thisDirPath == "" {
+		thisDirPath = "/"
 	}
-
-	if !reflect.DeepEqual(dir.Platform, other.Platform) {
+	otherDirPath := other.Dir
+	if otherDirPath == "" {
+		otherDirPath = "/"
+	}
+	if thisDirPath != otherDirPath {
 		// TODO(vito): work around with llb.Copy shenanigans?
-		return nil, fmt.Errorf("TODO: cannot diff across platforms: %+v != %+v", dir.Platform, other.Platform)
+		return nil, fmt.Errorf("cannot diff with different relative paths: %q != %q", dir.Dir, other.Dir)
 	}
 
 	lowerSt, err := dir.State()
@@ -486,7 +700,7 @@ func (dir *Directory) Diff(ctx context.Context, other *Directory) (*Directory, e
 		return nil, err
 	}
 
-	err = dir.SetState(ctx, llb.Diff(lowerSt, upperSt, dir.Pipeline.LLBOpt()))
+	err = dir.SetState(ctx, llb.Diff(lowerSt, upperSt))
 	if err != nil {
 		return nil, err
 	}
@@ -494,7 +708,7 @@ func (dir *Directory) Diff(ctx context.Context, other *Directory) (*Directory, e
 	return dir, nil
 }
 
-func (dir *Directory) Without(ctx context.Context, path string) (*Directory, error) {
+func (dir *Directory) Without(ctx context.Context, paths ...string) (*Directory, error) {
 	dir = dir.Clone()
 
 	st, err := dir.State()
@@ -502,7 +716,16 @@ func (dir *Directory) Without(ctx context.Context, path string) (*Directory, err
 		return nil, err
 	}
 
-	err = dir.SetState(ctx, st.File(llb.Rm(path, llb.WithAllowWildcard(true)), dir.Pipeline.LLBOpt()))
+	var action *llb.FileAction
+	for _, path := range paths {
+		path = filepath.Join(dir.Dir, path)
+		if action == nil {
+			action = llb.Rm(path, llb.WithAllowWildcard(true), llb.WithAllowNotFound(true))
+		} else {
+			action = action.Rm(path, llb.WithAllowWildcard(true), llb.WithAllowNotFound(true))
+		}
+	}
+	err = dir.SetState(ctx, st.File(action))
 	if err != nil {
 		return nil, err
 	}
@@ -510,53 +733,45 @@ func (dir *Directory) Without(ctx context.Context, path string) (*Directory, err
 	return dir, nil
 }
 
-func (dir *Directory) Export(
-	ctx context.Context,
-	host *Host,
-	dest string,
-	bkClient *bkclient.Client,
-	solveOpts bkclient.SolveOpt,
-	solveCh chan<- *bkclient.SolveStatus,
-) error {
-	dest, err := host.NormalizeDest(dest)
+func (dir *Directory) Export(ctx context.Context, destPath string, merge bool) (rerr error) {
+	svcs, err := dir.Query.Services(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get services: %w", err)
+	}
+	bk, err := dir.Query.Buildkit(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get buildkit client: %w", err)
+	}
+
+	var defPB *pb.Definition
+	if dir.Dir != "" && dir.Dir != "/" {
+		src, err := dir.State()
+		if err != nil {
+			return err
+		}
+		src = llb.Scratch().File(llb.Copy(src, dir.Dir, ".", &llb.CopyInfo{
+			CopyDirContentsOnly: true,
+		}))
+
+		def, err := src.Marshal(ctx, llb.Platform(dir.Platform.Spec()))
+		if err != nil {
+			return err
+		}
+		defPB = def.ToPB()
+	} else {
+		defPB = dir.LLB
+	}
+
+	ctx, span := Tracer(ctx).Start(ctx, fmt.Sprintf("export directory %s to host %s", dir.Dir, destPath))
+	defer telemetry.End(span, func() error { return rerr })
+
+	detach, _, err := svcs.StartBindings(ctx, dir.Services)
 	if err != nil {
 		return err
 	}
+	defer detach()
 
-	return host.Export(ctx, bkclient.ExportEntry{
-		Type:      bkclient.ExporterLocal,
-		OutputDir: dest,
-	}, bkClient, solveOpts, solveCh, func(ctx context.Context, gw bkgw.Client) (*bkgw.Result, error) {
-		return WithServices(ctx, gw, dir.Services, func() (*bkgw.Result, error) {
-			src, err := dir.State()
-			if err != nil {
-				return nil, err
-			}
-
-			var defPB *pb.Definition
-			if dir.Dir != "" {
-				src = llb.Scratch().File(llb.Copy(src, dir.Dir, ".", &llb.CopyInfo{
-					CopyDirContentsOnly: true,
-				}),
-					dir.Pipeline.LLBOpt(),
-				)
-
-				def, err := src.Marshal(ctx, llb.Platform(dir.Platform))
-				if err != nil {
-					return nil, err
-				}
-
-				defPB = def.ToPB()
-			} else {
-				defPB = dir.LLB
-			}
-
-			return gw.Solve(ctx, bkgw.SolveRequest{
-				Evaluate:   true,
-				Definition: defPB,
-			})
-		})
-	})
+	return bk.LocalDirExport(ctx, defPB, destPath, merge)
 }
 
 // Root removes any relative path from the directory.

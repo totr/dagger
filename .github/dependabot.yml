@@ -1,79 +1,134 @@
 version: 2
 updates:
   - package-ecosystem: "gomod"
-    directory: "/"
+    directories:
+      - "/"
+      - "/sdk/go"
     schedule:
-      interval: "monthly"
+      interval: "weekly"
+      day: "monday"
+      time: "07:00"
+      timezone: "UTC"
     labels:
       - "kind/dependencies"
       - "area/engine"
       - "area/cli"
+      - "area/sdk/go"
     ignore:
-      - dependency-name: "*"
-        update-types: ["version-update:semver-patch"]
-
-  - package-ecosystem: "docker"
-    directory: "/"
-    schedule:
-      interval: "monthly"
-    labels:
-      - "kind/dependencies"
-      - "area/tooling"
-    ignore:
-      - dependency-name: "*"
-        update-types: ["version-update:semver-patch"]
-
-  - package-ecosystem: "gomod"
-    directory: "/internal/mage"
-    schedule:
-      interval: "monthly"
-    labels:
-      - "kind/dependencies"
-      - "area/tooling"
-    ignore:
-      - dependency-name: "*"
-        update-types: ["version-update:semver-patch"]
+        # these are fiddly, we want to do them manually
+      - dependency-name: "go.opentelemetry.io/*"
+      - dependency-name: "github.com/moby/buildkit"
+      - dependency-name: "github.com/tonistiigi/fsutil"
+      - dependency-name: "github.com/vito/midterm"
+      # stargz-snapshotter requires containerd/v2, we're not using that
+      - dependency-name: "github.com/containerd/stargz-snapshotter"
+    groups:
+      engine:
+        applies-to: version-updates
+        patterns:
+          - "*"
 
   - package-ecosystem: "npm"
-    directory: "/sdk/nodejs"
+    directory: "/sdk/typescript"
     schedule:
-      interval: "monthly"
+      interval: "weekly"
+      day: "monday"
+      time: "07:00"
+      timezone: "UTC"
     labels:
       - "kind/dependencies"
-      - "sdk/nodejs"
-    ignore:
-      - dependency-name: "*"
-        update-types: ["version-update:semver-patch"]
+      - "area/sdk/typescript"
+    groups:
+      sdk-typescript:
+        applies-to: version-updates
+        patterns:
+          - "*"
 
   - package-ecosystem: "npm"
-    directory: "/website"
+    directory: "/docs"
     schedule:
-      interval: "monthly"
+      interval: "weekly"
+      day: "monday"
+      time: "07:00"
+      timezone: "UTC"
     labels:
       - "kind/dependencies"
-      - "area/docs"
-    ignore:
-      - dependency-name: "*"
-        update-types: ["version-update:semver-patch"]
-
-  - package-ecosystem: "gomod"
-    directory: "/sdk/go"
-    schedule:
-      interval: "monthly"
-    labels:
-      - "kind/dependencies"
-      - "sdk/go"
-    ignore:
-      - dependency-name: "*"
-        update-types: ["version-update:semver-patch"]
+      - "area/documentation"
+    groups:
+      docs:
+        applies-to: version-updates
+        patterns:
+          - "*"
 
   - package-ecosystem: "pip"
     directory: "/sdk/python"
     schedule:
-      interval: "monthly"
+      interval: "weekly"
+      day: "monday"
+      time: "07:00"
+      timezone: "UTC"
     labels:
       - "kind/dependencies"
-      - "sdk/python"
+      - "area/sdk/python"
+    groups:
+      sdk-python:
+        applies-to: version-updates
+        patterns:
+          - "*"
+
+  - package-ecosystem: "docker"
+    directories:
+      - "/sdk/python/runtime"
+      - "/modules/ruff/build"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "07:00"
+      timezone: "UTC"
+    labels:
+      - "kind/dependencies"
+      - "area/sdk/python"
     ignore:
-      - dependency-name: "*"
-        update-types: ["version-update:semver-patch"]
+      # python needs to be manually bumped
+      - dependency-name: "python"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+    groups:
+      sdk-python-docker:
+        applies-to: version-updates
+        patterns:
+          - "*"
+
+  - package-ecosystem: "maven"
+    directory: "/sdk/java"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "07:00"
+      timezone: "UTC"
+    labels:
+      - "kind/dependencies"
+      - "area/sdk/java"
+    ignore:
+      # ignore maven dependencies (API, plugins, etc)
+      - dependency-name: "org.apache.maven*"
+    groups:
+      sdk-java:
+        applies-to: version-updates
+        patterns:
+          - "*"
+
+  - package-ecosystem: "mix"
+    directory: "/sdk/elixir"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "07:00"
+      timezone: "UTC"
+    labels:
+      - "kind/dependencies"
+      - "area/sdk/elixir"
+    groups:
+      sdk-elixir:
+        applies-to: version-updates
+        patterns:
+          - "*"

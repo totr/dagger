@@ -2,48 +2,68 @@ package core
 
 import (
 	"context"
-	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"io/fs"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
-	"sync"
 
-	"github.com/dagger/dagger/core/reffs"
 	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/frontend/dockerfile/shell"
 	bkgw "github.com/moby/buildkit/frontend/gateway/client"
+	"github.com/moby/buildkit/solver/llbsolver/provenance"
 	"github.com/moby/buildkit/solver/pb"
+	"github.com/moby/sys/user"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
-	"github.com/opencontainers/runc/libcontainer/user"
+	"github.com/pkg/errors"
+
+	"github.com/dagger/dagger/core/reffs"
+	"github.com/dagger/dagger/dagql"
+	"github.com/dagger/dagger/engine/buildkit"
+	"github.com/dagger/dagger/engine/slog"
 )
 
-// encodeID JSON marshals and base64-encodes an arbitrary payload.
-func encodeID[T ~string](payload any) (T, error) {
-	jsonBytes, err := json.Marshal(payload)
-	if err != nil {
-		return "", err
-	}
-
-	b64Bytes := make([]byte, base64.StdEncoding.EncodedLen(len(jsonBytes)))
-	base64.StdEncoding.Encode(b64Bytes, jsonBytes)
-
-	return T(b64Bytes), nil
+type HasPBDefinitions interface {
+	PBDefinitions(context.Context) ([]*pb.Definition, error)
 }
 
-// decodeID base64-decodes and JSON unmarshals an ID into an arbitrary payload.
-func decodeID[T ~string](payload any, id T) error {
-	jsonBytes := make([]byte, base64.StdEncoding.DecodedLen(len(id)))
-	n, err := base64.StdEncoding.Decode(jsonBytes, []byte(id))
-	if err != nil {
-		return fmt.Errorf("failed to decode %T bytes: %v: %w", payload, id, err)
+func collectPBDefinitions(ctx context.Context, value dagql.Typed) ([]*pb.Definition, error) {
+	switch x := value.(type) {
+	case dagql.String, dagql.Int, dagql.Boolean, dagql.Float:
+		// nothing to do
+		return nil, nil
+	case dagql.Enumerable: // dagql.Array
+		defs := []*pb.Definition{}
+		for i := 1; i < x.Len(); i++ {
+			val, err := x.Nth(i)
+			if err != nil {
+				return nil, fmt.Errorf("failed to get nth value: %w", err)
+			}
+			elemDefs, err := collectPBDefinitions(ctx, val)
+			if err != nil {
+				return nil, fmt.Errorf("failed to link nth value dependency blobs: %w", err)
+			}
+			defs = append(defs, elemDefs...)
+		}
+		return defs, nil
+	case dagql.Derefable: // dagql.Nullable
+		if inner, ok := x.Deref(); ok {
+			return collectPBDefinitions(ctx, inner)
+		} else {
+			return nil, nil
+		}
+	case dagql.Wrapper: // dagql.Instance
+		return collectPBDefinitions(ctx, x.Unwrap())
+	case HasPBDefinitions:
+		return x.PBDefinitions(ctx)
+	default:
+		// NB: being SUPER cautious for now, since this feels a bit spooky to drop
+		// on the floor. might be worth just implementing HasPBDefinitions for
+		// everything. (would be nice to just skip scalars though.)
+		slog.Warn("collectPBDefinitions: unhandled type", "type", fmt.Sprintf("%T", value))
+		return nil, nil
 	}
-
-	jsonBytes = jsonBytes[:n]
-
-	return json.Unmarshal(jsonBytes, payload)
 }
 
 func absPath(workDir string, containerPath string) string {
@@ -75,32 +95,7 @@ func defToState(def *pb.Definition) (llb.State, error) {
 	return llb.NewState(defop), nil
 }
 
-// mirrorCh mirrors messages from one channel to another, protecting the
-// destination channel from being closed.
-//
-// this is used to reflect Build/Solve progress in a longer-lived progress UI,
-// since they close the channel when they're done.
-func mirrorCh[T any](dest chan<- T) (chan T, *sync.WaitGroup) {
-	wg := new(sync.WaitGroup)
-
-	if dest == nil {
-		return nil, wg
-	}
-
-	mirrorCh := make(chan T)
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for event := range mirrorCh {
-			dest <- event
-		}
-	}()
-
-	return mirrorCh, wg
-}
-
-func resolveUIDGID(ctx context.Context, fsSt llb.State, gw bkgw.Client, platform specs.Platform, owner string) (*Ownership, error) {
+func resolveUIDGID(ctx context.Context, fsSt llb.State, bk *buildkit.Client, platform Platform, owner string) (*Ownership, error) {
 	uidOrName, gidOrName, hasGroup := strings.Cut(owner, ":")
 
 	var uid, gid int
@@ -120,7 +115,7 @@ func resolveUIDGID(ctx context.Context, fsSt llb.State, gw bkgw.Client, platform
 
 	var fs fs.FS
 	if uname != "" || gname != "" {
-		fs, err = reffs.OpenState(ctx, gw, fsSt, llb.Platform(platform))
+		fs, err = reffs.OpenState(ctx, bk, fsSt, llb.Platform(platform.Spec()))
 		if err != nil {
 			return nil, fmt.Errorf("open fs state for name->id: %w", err)
 		}
@@ -278,7 +273,7 @@ func mergeEnv(dst, src []string) []string {
 
 // mergeMap adds or updates every key-value pair from the 'src' map
 // into the 'dst' map.
-func mergeMap(dst, src map[string]string) map[string]string {
+func mergeMap[T any](dst, src map[string]T) map[string]T {
 	if src == nil {
 		return dst
 	}
@@ -299,14 +294,49 @@ func mergeMap(dst, src map[string]string) map[string]string {
 // Only the configurations that have corresponding `WithXXX` and `WithoutXXX`
 // methods in `Container` are added or updated (i.e., `Env`, `Labels` and
 // `ExposedPorts`). Everything else is replaced.
-//
-// NOTE: there is an issue with merged ports for now.
-// See: https://github.com/dagger/dagger/pull/5052#issuecomment-1546814114
 func mergeImageConfig(dst, src specs.ImageConfig) specs.ImageConfig {
 	res := src
 
 	res.Env = mergeEnv(dst.Env, src.Env)
 	res.Labels = mergeMap(dst.Labels, src.Labels)
+	res.ExposedPorts = mergeMap(dst.ExposedPorts, src.ExposedPorts)
 
 	return res
+}
+
+func resolveProvenance(ctx context.Context, bk *buildkit.Client, st llb.State) (*provenance.Capture, error) {
+	def, err := st.Marshal(ctx)
+	if err != nil {
+		return nil, err
+	}
+	res, err := bk.Solve(ctx, bkgw.SolveRequest{
+		Evaluate:   true,
+		Definition: def.ToPB(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	p := res.Ref.Provenance()
+	if p == nil {
+		return nil, errors.Errorf("no provenance was resolved")
+	}
+	return p, nil
+}
+
+func ptr[T any](v T) *T {
+	return &v
+}
+
+// SliceSet is a generic type that represents a set implemented as a slice.
+// TODO: it can eventually be replaced with a more performant underlying
+// data structure like a tree since the current implementation is O(n) but
+// it's fine as it's used ofor small sets currently.
+type SliceSet[T comparable] []T
+
+// Append adds an element to the SliceSet if it's not already present.
+func (s *SliceSet[T]) Append(element T) {
+	if slices.Contains(*s, element) {
+		return
+	}
+	*s = append(*s, element)
 }
