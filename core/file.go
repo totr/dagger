@@ -2,184 +2,281 @@ package core
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"io"
-	"os"
+	"io/fs"
 	"path"
-	"path/filepath"
 	"time"
 
-	"github.com/dagger/dagger/core/pipeline"
-	"github.com/dagger/dagger/core/reffs"
-	"github.com/dagger/dagger/router"
-	bkclient "github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/client/llb"
 	bkgw "github.com/moby/buildkit/frontend/gateway/client"
 	"github.com/moby/buildkit/solver/pb"
 	"github.com/opencontainers/go-digest"
-	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	fstypes "github.com/tonistiigi/fsutil/types"
+	"github.com/vektah/gqlparser/v2/ast"
+
+	"dagger.io/dagger/telemetry"
+	"github.com/dagger/dagger/core/reffs"
+	"github.com/dagger/dagger/engine/buildkit"
 )
 
 // File is a content-addressed file.
 type File struct {
+	Query *Query
+
 	LLB      *pb.Definition `json:"llb"`
 	File     string         `json:"file"`
-	Pipeline pipeline.Path  `json:"pipeline"`
-	Platform specs.Platform `json:"platform"`
+	Platform Platform       `json:"platform"`
 
 	// Services necessary to provision the file.
 	Services ServiceBindings `json:"services,omitempty"`
 }
 
-func NewFile(ctx context.Context, def *pb.Definition, file string, pipeline pipeline.Path, platform specs.Platform, services ServiceBindings) *File {
+func (*File) Type() *ast.Type {
+	return &ast.Type{
+		NamedType: "File",
+		NonNull:   true,
+	}
+}
+
+func (*File) TypeDescription() string {
+	return "A file."
+}
+
+var _ HasPBDefinitions = (*File)(nil)
+
+func (file *File) PBDefinitions(ctx context.Context) ([]*pb.Definition, error) {
+	var defs []*pb.Definition
+	if file.LLB != nil {
+		defs = append(defs, file.LLB)
+	}
+	for _, bnd := range file.Services {
+		ctr := bnd.Service.Container
+		if ctr == nil {
+			continue
+		}
+		ctrDefs, err := ctr.PBDefinitions(ctx)
+		if err != nil {
+			return nil, err
+		}
+		defs = append(defs, ctrDefs...)
+	}
+	return defs, nil
+}
+
+func NewFile(query *Query, def *pb.Definition, file string, platform Platform, services ServiceBindings) *File {
 	return &File{
+		Query:    query,
 		LLB:      def,
 		File:     file,
-		Pipeline: pipeline,
 		Platform: platform,
 		Services: services,
 	}
 }
 
-func NewFileSt(ctx context.Context, st llb.State, dir string, pipeline pipeline.Path, platform specs.Platform, services ServiceBindings) (*File, error) {
-	def, err := st.Marshal(ctx, llb.Platform(platform))
+func NewFileWithContents(
+	ctx context.Context,
+	query *Query,
+	name string,
+	content []byte,
+	permissions fs.FileMode,
+	ownership *Ownership,
+	platform Platform,
+) (*File, error) {
+	dir, err := NewScratchDirectory(ctx, query, platform)
+	if err != nil {
+		return nil, err
+	}
+	dir, err = dir.WithNewFile(ctx, name, content, permissions, ownership)
+	if err != nil {
+		return nil, err
+	}
+	return dir.File(ctx, name)
+}
+
+func NewFileSt(ctx context.Context, query *Query, st llb.State, dir string, platform Platform, services ServiceBindings) (*File, error) {
+	def, err := st.Marshal(ctx, llb.Platform(platform.Spec()))
 	if err != nil {
 		return nil, err
 	}
 
-	return NewFile(ctx, def.ToPB(), dir, pipeline, platform, services), nil
+	return NewFile(query, def.ToPB(), dir, platform, services), nil
 }
 
 // Clone returns a deep copy of the container suitable for modifying in a
 // WithXXX method.
 func (file *File) Clone() *File {
 	cp := *file
-	cp.Pipeline = cloneSlice(cp.Pipeline)
-	cp.Services = cloneMap(cp.Services)
+	cp.Services = cloneSlice(cp.Services)
 	return &cp
-}
-
-// FileID is an opaque value representing a content-addressed file.
-type FileID string
-
-func (id FileID) String() string {
-	return string(id)
-}
-
-// FileID is digestible so that smaller hashes can be displayed in
-// --debug vertex names.
-var _ router.Digestible = FileID("")
-
-func (id FileID) Digest() (digest.Digest, error) {
-	return digest.FromString(id.String()), nil
-}
-
-func (id FileID) ToFile() (*File, error) {
-	var file File
-	if err := decodeID(&file, id); err != nil {
-		return nil, err
-	}
-
-	return &file, nil
-}
-
-// ID marshals the file into a content-addressed ID.
-func (file *File) ID() (FileID, error) {
-	return encodeID[FileID](file)
-}
-
-var _ router.Pipelineable = (*File)(nil)
-
-func (file *File) PipelinePath() pipeline.Path {
-	// TODO(vito): test
-	return file.Pipeline
-}
-
-// File is digestible so that it can be recorded as an output of the --debug
-// vertex that created it.
-var _ router.Digestible = (*File)(nil)
-
-// Digest returns the file's content hash.
-func (file *File) Digest() (digest.Digest, error) {
-	id, err := file.ID()
-	if err != nil {
-		return "", err
-	}
-	return id.Digest()
 }
 
 func (file *File) State() (llb.State, error) {
 	return defToState(file.LLB)
 }
 
-// Contents handles file content retrieval
-func (file *File) Contents(ctx context.Context, gw bkgw.Client) ([]byte, error) {
-	return WithServices(ctx, gw, file.Services, func() ([]byte, error) {
-		ref, err := gwRef(ctx, gw, file.LLB)
-		if err != nil {
-			return nil, err
-		}
+func (file *File) Evaluate(ctx context.Context) (*buildkit.Result, error) {
+	svcs, err := file.Query.Services(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get services: %w", err)
+	}
+	bk, err := file.Query.Buildkit(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get buildkit client: %w", err)
+	}
 
-		// Stat the file and preallocate file contents buffer:
-		st, err := file.Stat(ctx, gw)
-		if err != nil {
-			return nil, err
-		}
+	detach, _, err := svcs.StartBindings(ctx, file.Services)
+	if err != nil {
+		return nil, err
+	}
+	defer detach()
 
-		// Error on files that exceed MaxFileContentsSize:
-		fileSize := int(st.GetSize_())
-		if fileSize > MaxFileContentsSize {
-			// TODO: move to proper error structure
-			return nil, fmt.Errorf("file size %d exceeds limit %d", fileSize, MaxFileContentsSize)
-		}
-
-		// Allocate buffer with the given file size:
-		contents := make([]byte, fileSize)
-
-		// Use a chunked reader to overcome issues when
-		// the input file exceeds MaxFileContentsChunkSize:
-		var offset int
-		for offset < fileSize {
-			chunk, err := ref.ReadFile(ctx, bkgw.ReadRequest{
-				Filename: file.File,
-				Range: &bkgw.FileRange{
-					Offset: offset,
-					Length: MaxFileContentsChunkSize,
-				},
-			})
-			if err != nil {
-				return nil, err
-			}
-
-			// Copy the chunk and increment offset for subsequent reads:
-			copy(contents[offset:], chunk)
-			offset += len(chunk)
-		}
-		return contents, nil
+	return bk.Solve(ctx, bkgw.SolveRequest{
+		Evaluate:   true,
+		Definition: file.LLB,
 	})
 }
 
-func (file *File) Secret(ctx context.Context) (*Secret, error) {
-	id, err := file.ID()
+// Contents handles file content retrieval
+func (file *File) Contents(ctx context.Context) ([]byte, error) {
+	svcs, err := file.Query.Services(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get services: %w", err)
+	}
+	bk, err := file.Query.Buildkit(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get buildkit client: %w", err)
+	}
+
+	detach, _, err := svcs.StartBindings(ctx, file.Services)
+	if err != nil {
+		return nil, err
+	}
+	defer detach()
+
+	ref, err := bkRef(ctx, bk, file.LLB)
 	if err != nil {
 		return nil, err
 	}
 
-	return NewSecretFromFile(id), nil
-}
+	// Stat the file and preallocate file contents buffer:
+	st, err := file.Stat(ctx)
+	if err != nil {
+		return nil, err
+	}
 
-func (file *File) Stat(ctx context.Context, gw bkgw.Client) (*fstypes.Stat, error) {
-	return WithServices(ctx, gw, file.Services, func() (*fstypes.Stat, error) {
-		ref, err := gwRef(ctx, gw, file.LLB)
+	// Error on files that exceed MaxFileContentsSize:
+	fileSize := int(st.GetSize_())
+	if fileSize > buildkit.MaxFileContentsSize {
+		// TODO: move to proper error structure
+		return nil, fmt.Errorf("file size %d exceeds limit %d", fileSize, buildkit.MaxFileContentsSize)
+	}
+
+	// Allocate buffer with the given file size:
+	contents := make([]byte, fileSize)
+
+	// Use a chunked reader to overcome issues when
+	// the input file exceeds MaxFileContentsChunkSize:
+	var offset int
+	for offset < fileSize {
+		chunk, err := ref.ReadFile(ctx, bkgw.ReadRequest{
+			Filename: file.File,
+			Range: &bkgw.FileRange{
+				Offset: offset,
+				Length: buildkit.MaxFileContentsChunkSize,
+			},
+		})
 		if err != nil {
 			return nil, err
 		}
 
-		return ref.StatFile(ctx, bkgw.StatRequest{
-			Path: file.File,
-		})
+		// Copy the chunk and increment offset for subsequent reads:
+		copy(contents[offset:], chunk)
+		offset += len(chunk)
+	}
+	return contents, nil
+}
+
+func (file *File) Digest(ctx context.Context, excludeMetadata bool) (string, error) {
+	// If metadata are included, directly compute the digest of the file
+	if !excludeMetadata {
+		result, err := file.Evaluate(ctx)
+		if err != nil {
+			return "", fmt.Errorf("failed to evaluate file: %w", err)
+		}
+
+		digest, err := result.Ref.Digest(ctx, file.File)
+		if err != nil {
+			return "", fmt.Errorf("failed to compute digest: %w", err)
+		}
+
+		return digest.String(), nil
+	}
+
+	// If metadata are excluded, compute the digest of the file from its content.
+	reader, err := file.Open(ctx)
+	if err != nil {
+		return "", fmt.Errorf("failed to open file to compute digest: %w", err)
+	}
+
+	defer reader.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, reader); err != nil {
+		return "", fmt.Errorf("failed to copy file content into hasher: %w", err)
+	}
+
+	return digest.FromBytes(h.Sum(nil)).String(), nil
+}
+
+func (file *File) Stat(ctx context.Context) (*fstypes.Stat, error) {
+	svcs, err := file.Query.Services(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get services: %w", err)
+	}
+	bk, err := file.Query.Buildkit(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get buildkit client: %w", err)
+	}
+
+	detach, _, err := svcs.StartBindings(ctx, file.Services)
+	if err != nil {
+		return nil, err
+	}
+	defer detach()
+
+	ref, err := bkRef(ctx, bk, file.LLB)
+	if err != nil {
+		return nil, err
+	}
+
+	return ref.StatFile(ctx, bkgw.StatRequest{
+		Path: file.File,
 	})
+}
+
+func (file *File) WithName(ctx context.Context, filename string) (*File, error) {
+	// Clone the file
+	file = file.Clone()
+
+	st, err := file.State()
+	if err != nil {
+		return nil, err
+	}
+
+	// Create a new file with the new name
+	newFile := llb.Scratch().File(llb.Copy(st, file.File, path.Base(filename)))
+
+	def, err := newFile.Marshal(ctx, llb.Platform(file.Platform.Spec()))
+	if err != nil {
+		return nil, err
+	}
+
+	file.LLB = def.ToPB()
+	file.File = path.Base(filename)
+
+	return file, nil
 }
 
 func (file *File) WithTimestamps(ctx context.Context, unix int) (*File, error) {
@@ -192,12 +289,9 @@ func (file *File) WithTimestamps(ctx context.Context, unix int) (*File, error) {
 
 	t := time.Unix(int64(unix), 0)
 
-	stamped := llb.Scratch().File(
-		llb.Copy(st, file.File, ".", llb.WithCreatedTime(t)),
-		file.Pipeline.LLBOpt(),
-	)
+	stamped := llb.Scratch().File(llb.Copy(st, file.File, ".", llb.WithCreatedTime(t)))
 
-	def, err := stamped.Marshal(ctx, llb.Platform(file.Platform))
+	def, err := stamped.Marshal(ctx, llb.Platform(file.Platform.Spec()))
 	if err != nil {
 		return nil, err
 	}
@@ -207,67 +301,64 @@ func (file *File) WithTimestamps(ctx context.Context, unix int) (*File, error) {
 	return file, nil
 }
 
-func (file *File) Open(ctx context.Context, host *Host, gw bkgw.Client) (io.ReadCloser, error) {
-	return WithServices(ctx, gw, file.Services, func() (io.ReadCloser, error) {
-		fs, err := reffs.OpenDef(ctx, gw, file.LLB)
-		if err != nil {
-			return nil, err
-		}
+func (file *File) Open(ctx context.Context) (io.ReadCloser, error) {
+	bk, err := file.Query.Buildkit(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get buildkit client: %w", err)
+	}
+	svcs, err := file.Query.Services(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get services: %w", err)
+	}
 
-		return fs.Open(file.File)
-	})
+	detach, _, err := svcs.StartBindings(ctx, file.Services)
+	if err != nil {
+		return nil, err
+	}
+	defer detach()
+
+	fs, err := reffs.OpenDef(ctx, bk, file.LLB)
+	if err != nil {
+		return nil, err
+	}
+
+	return fs.Open(file.File)
 }
 
-func (file *File) Export(
-	ctx context.Context,
-	host *Host,
-	dest string,
-	bkClient *bkclient.Client,
-	solveOpts bkclient.SolveOpt,
-	solveCh chan<- *bkclient.SolveStatus,
-) error {
-	dest, err := host.NormalizeDest(dest)
+func (file *File) Export(ctx context.Context, dest string, allowParentDirPath bool) (rerr error) {
+	svcs, err := file.Query.Services(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get services: %w", err)
+	}
+	bk, err := file.Query.Buildkit(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get buildkit client: %w", err)
+	}
+
+	src, err := file.State()
+	if err != nil {
+		return err
+	}
+	def, err := src.Marshal(ctx, llb.Platform(file.Platform.Spec()))
 	if err != nil {
 		return err
 	}
 
-	if stat, err := os.Stat(dest); err == nil {
-		if stat.IsDir() {
-			return fmt.Errorf("destination %q is a directory; must be a file path", dest)
-		}
+	ctx, vtx := Tracer(ctx).Start(ctx, fmt.Sprintf("export file %s to host %s", file.File, dest))
+	defer telemetry.End(vtx, func() error { return rerr })
+
+	detach, _, err := svcs.StartBindings(ctx, file.Services)
+	if err != nil {
+		return err
 	}
+	defer detach()
 
-	destFilename := filepath.Base(dest)
-	destDir := filepath.Dir(dest)
-
-	return host.Export(ctx, bkclient.ExportEntry{
-		Type:      bkclient.ExporterLocal,
-		OutputDir: destDir,
-	}, bkClient, solveOpts, solveCh, func(ctx context.Context, gw bkgw.Client) (*bkgw.Result, error) {
-		return WithServices(ctx, gw, file.Services, func() (*bkgw.Result, error) {
-			src, err := file.State()
-			if err != nil {
-				return nil, err
-			}
-
-			src = llb.Scratch().File(llb.Copy(src, file.File, destFilename), file.Pipeline.LLBOpt())
-
-			def, err := src.Marshal(ctx, llb.Platform(file.Platform))
-			if err != nil {
-				return nil, err
-			}
-
-			return gw.Solve(ctx, bkgw.SolveRequest{
-				Evaluate:   true,
-				Definition: def.ToPB(),
-			})
-		})
-	})
+	return bk.LocalFileExport(ctx, def.ToPB(), dest, file.File, allowParentDirPath)
 }
 
-// gwRef returns the buildkit reference from the solved def.
-func gwRef(ctx context.Context, gw bkgw.Client, def *pb.Definition) (bkgw.Reference, error) {
-	res, err := gw.Solve(ctx, bkgw.SolveRequest{
+// bkRef returns the buildkit reference from the solved def.
+func bkRef(ctx context.Context, bk *buildkit.Client, def *pb.Definition) (bkgw.Reference, error) {
+	res, err := bk.Solve(ctx, bkgw.SolveRequest{
 		Definition: def,
 	})
 	if err != nil {

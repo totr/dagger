@@ -1,6 +1,12 @@
-use std::{collections::HashMap, ops::Add, sync::Arc};
+use std::{
+    collections::HashMap,
+    ops::{Add, Deref},
+    pin::Pin,
+    sync::Arc,
+};
 
 use crate::core::graphql_client::DynGraphQLClient;
+use futures::{future, Future};
 use serde::{Deserialize, Serialize};
 
 use crate::errors::{DaggerError, DaggerUnpackError};
@@ -9,22 +15,41 @@ pub fn query() -> Selection {
     Selection::default()
 }
 
-impl Default for Selection {
-    fn default() -> Self {
-        Self {
-            name: Default::default(),
-            alias: Default::default(),
-            args: Default::default(),
-            prev: Default::default(),
-        }
+#[derive(Clone)]
+struct LazyResolve(Arc<dyn Fn() -> Pin<Box<dyn Future<Output = String> + Send>> + Send + Sync>);
+
+impl LazyResolve {
+    pub fn new(
+        func: Box<dyn Fn() -> Pin<Box<dyn Future<Output = String> + Send>> + Send + Sync>,
+    ) -> Self {
+        Self(Arc::new(func))
+    }
+
+    pub fn from_string(val: impl Into<String>) -> Self {
+        let val: String = val.into();
+        Self(Arc::new(move || Box::pin(future::ready(val.clone()))))
     }
 }
 
-#[derive(Debug, Clone)]
+impl Deref for LazyResolve {
+    type Target = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = String> + Send>> + Send + Sync>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl From<String> for LazyResolve {
+    fn from(value: String) -> Self {
+        LazyResolve::from_string(value)
+    }
+}
+
+#[derive(Clone, Default)]
 pub struct Selection {
     name: Option<String>,
     alias: Option<String>,
-    args: Option<HashMap<String, String>>,
+    args: Option<HashMap<String, LazyResolve>>,
 
     prev: Option<Arc<Selection>>,
 }
@@ -54,15 +79,15 @@ impl Selection {
     {
         let mut s = self.clone();
 
-        let val = serde_json::to_string(&value).unwrap();
+        let val = serde_graphql_input::to_string_pretty(&value).unwrap();
 
         match s.args.as_mut() {
             Some(args) => {
-                let _ = args.insert(name.to_string(), val);
+                let _ = args.insert(name.to_string(), val.into());
             }
             None => {
                 let mut hm = HashMap::new();
-                let _ = hm.insert(name.to_string(), val);
+                let _ = hm.insert(name.to_string(), val.into());
                 s.args = Some(hm);
             }
         }
@@ -70,22 +95,20 @@ impl Selection {
         s
     }
 
-    pub fn arg_enum<S>(&self, name: &str, value: S) -> Selection
-    where
-        S: Serialize,
-    {
+    pub fn arg_lazy(
+        &self,
+        name: &str,
+        value: Box<dyn Fn() -> Pin<Box<dyn Future<Output = String> + Send>> + Send + Sync>,
+    ) -> Selection {
         let mut s = self.clone();
 
-        let val = serde_json::to_string(&value).unwrap();
-        let val = val[1..val.len() - 1].to_string();
-
         match s.args.as_mut() {
             Some(args) => {
-                let _ = args.insert(name.to_string(), val);
+                let _ = args.insert(name.to_string(), LazyResolve::new(Box::new(value)));
             }
             None => {
                 let mut hm = HashMap::new();
-                let _ = hm.insert(name.to_string(), val);
+                let _ = hm.insert(name.to_string(), LazyResolve::new(Box::new(value)));
                 s.args = Some(hm);
             }
         }
@@ -93,16 +116,17 @@ impl Selection {
         s
     }
 
-    pub fn build(&self) -> Result<String, DaggerError> {
+    pub async fn build(&self) -> Result<String, DaggerError> {
         let mut fields = vec!["query".to_string()];
 
         for sel in self.path() {
-            if let Some(mut query) = sel.name.map(|q| q.clone()) {
+            if let Some(mut query) = sel.name {
                 if let Some(args) = sel.args {
-                    let actualargs = args
-                        .iter()
-                        .map(|(name, arg)| format!("{name}:{}", arg.as_str()))
-                        .collect::<Vec<_>>();
+                    let mut actualargs = Vec::new();
+                    for (name, arg) in args.iter() {
+                        let arg = arg().await;
+                        actualargs.push(format!("{name}:{arg}"));
+                    }
 
                     query = query.add(&format!("({})", actualargs.join(", ")));
                 }
@@ -122,7 +146,7 @@ impl Selection {
     where
         D: for<'de> Deserialize<'de>,
     {
-        let query = self.build()?;
+        let query = self.build().await?;
 
         tracing::trace!(query = query.as_str(), "dagger-query");
 
@@ -165,6 +189,7 @@ impl Selection {
         }
     }
 
+    #[allow(clippy::only_used_in_recursion)]
     fn unpack_resp_value<D>(&self, r: serde_json::Value) -> Result<D, DaggerError>
     where
         D: for<'de> Deserialize<'de>,
@@ -192,8 +217,8 @@ mod tests {
 
     use super::query;
 
-    #[test]
-    fn test_query() {
+    #[tokio::test]
+    async fn test_query() {
         let root = query()
             .select("core")
             .select("image")
@@ -201,7 +226,7 @@ mod tests {
             .select("file")
             .arg("path", "/etc/alpine-release");
 
-        let query = root.build().unwrap();
+        let query = root.build().await.unwrap();
 
         assert_eq!(
             query,
@@ -209,8 +234,8 @@ mod tests {
         )
     }
 
-    #[test]
-    fn test_query_alias() {
+    #[tokio::test]
+    async fn test_query_alias() {
         let root = query()
             .select("core")
             .select("image")
@@ -218,7 +243,7 @@ mod tests {
             .select_with_alias("foo", "file")
             .arg("path", "/etc/alpine-release");
 
-        let query = root.build().unwrap();
+        let query = root.build().await.unwrap();
 
         assert_eq!(
             query,
@@ -226,57 +251,57 @@ mod tests {
         )
     }
 
-    #[test]
-    fn test_arg_collision() {
+    #[tokio::test]
+    async fn test_arg_collision() {
         let root = query()
             .select("a")
             .arg("arg", "one")
             .select("b")
             .arg("arg", "two");
 
-        let query = root.build().unwrap();
+        let query = root.build().await.unwrap();
 
         assert_eq!(query, r#"query{a(arg:"one"){b(arg:"two")}}"#.to_string())
     }
 
-    #[test]
-    fn test_vec_arg() {
+    #[tokio::test]
+    async fn test_vec_arg() {
         let input = vec!["some-string"];
 
         let root = query().select("a").arg("arg", input);
-        let query = root.build().unwrap();
+        let query = root.build().await.unwrap();
 
         assert_eq!(query, r#"query{a(arg:["some-string"])}"#.to_string())
     }
 
-    #[test]
-    fn test_ref_slice_arg() {
+    #[tokio::test]
+    async fn test_ref_slice_arg() {
         let input = &["some-string"];
 
         let root = query().select("a").arg("arg", input);
-        let query = root.build().unwrap();
+        let query = root.build().await.unwrap();
 
         assert_eq!(query, r#"query{a(arg:["some-string"])}"#.to_string())
     }
 
-    #[test]
-    fn test_stringb_arg() {
+    #[tokio::test]
+    async fn test_stringb_arg() {
         let input = "some-string".to_string();
 
         let root = query().select("a").arg("arg", input);
-        let query = root.build().unwrap();
+        let query = root.build().await.unwrap();
 
         assert_eq!(query, r#"query{a(arg:"some-string")}"#.to_string())
     }
 
-    #[test]
-    fn test_field_immutability() {
+    #[tokio::test]
+    async fn test_field_immutability() {
         let root = query().select("test");
 
-        let a = root.select("a").build().unwrap();
+        let a = root.select("a").build().await.unwrap();
         assert_eq!(a, r#"query{test{a}}"#.to_string());
 
-        let b = root.select("b").build().unwrap();
+        let b = root.select("b").build().await.unwrap();
         assert_eq!(b, r#"query{test{b}}"#.to_string());
     }
 
@@ -286,8 +311,8 @@ mod tests {
         pub s: Option<Box<CustomType>>,
     }
 
-    #[test]
-    fn test_arg_custom_type() {
+    #[tokio::test]
+    async fn test_arg_custom_type() {
         let input = CustomType {
             name: "some-name".to_string(),
             s: Some(Box::new(CustomType {
@@ -297,12 +322,11 @@ mod tests {
         };
 
         let root = query().select("a").arg("arg", input);
-        let query = root.build().unwrap();
+        let query = root.build().await.unwrap();
 
         assert_eq!(
             query,
-            r#"query{a(arg:{"name":"some-name","s":{"name":"some-other-name","s":null}})}"#
-                .to_string()
+            r#"query{a(arg:{name:"some-name",s:{name:"some-other-name",s:null}})}"#.to_string()
         )
     }
 }

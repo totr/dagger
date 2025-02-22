@@ -1,8 +1,12 @@
 Connection
 ==========
 
-.. automodule:: dagger.config
-   :members: Config
+.. currentmodule:: dagger
 
-.. automodule:: dagger.connection
-   :members:
+.. autofunction:: connection
+
+.. autoclass:: Connection
+   :no-show-inheritance:
+
+.. autoclass:: Config
+   :no-show-inheritance:

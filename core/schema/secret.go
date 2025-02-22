@@ -1,92 +1,188 @@
 package schema
 
 import (
+	"context"
+	"fmt"
+
 	"github.com/dagger/dagger/core"
-	"github.com/dagger/dagger/router"
+	"github.com/dagger/dagger/dagql"
+	"github.com/dagger/dagger/engine"
 )
 
 type secretSchema struct {
-	*baseSchema
+	srv *dagql.Server
 }
 
-var _ router.ExecutableSchema = &secretSchema{}
+var _ SchemaResolvers = &secretSchema{}
 
-func (s *secretSchema) Name() string {
-	return "secret"
+func (s *secretSchema) Install() {
+	dagql.Fields[*core.Query]{
+		dagql.Func("setSecret", s.setSecret).
+			Impure("`setSecret` mutates state in the internal secret store.").
+			Doc(`Sets a secret given a user defined name to its plaintext and returns the secret.`,
+				`The plaintext value is limited to a size of 128000 bytes.`).
+			ArgDoc("name", `The user defined name for this secret`).
+			ArgDoc("plaintext", `The plaintext of the secret`).
+			ArgSensitive("plaintext"),
+
+		dagql.Func("secret", s.secret).
+			Impure("`secret` mutates state in the internal secret store.").
+			Doc(`Creates a new secret.`).
+			ArgDoc("uri", `The URI of the secret store`),
+
+		dagql.Func("loadSecretFromName", s.loadSecretFromName).
+			Doc(`Load a Secret from its Name.`),
+	}.Install(s.srv)
+
+	dagql.Fields[*core.Secret]{
+		dagql.Func("name", s.name).
+			Doc(`The name of this secret.`),
+		dagql.Func("uri", s.uri).
+			Doc(`The URI of this secret.`),
+		dagql.Func("plaintext", s.plaintext).
+			Sensitive().
+			Impure("A secret's `plaintext` value in the internal secret store state can change.").
+			Doc(`The value of this secret.`),
+	}.Install(s.srv)
 }
 
-func (s *secretSchema) Schema() string {
-	return Secret
+type loadSecretFromNameArgs struct {
+	Name string
+
+	// Accessor is the scoped per-module name, which should guarantee uniqueness.
+	// It is used to ensure the dagql ID digest is unique per module; the digest is what's
+	// used as the actual key for the secret store.
+	Accessor dagql.Optional[dagql.String]
 }
 
-var secretIDResolver = stringResolver(core.SecretID(""))
-
-func (s *secretSchema) Resolvers() router.Resolvers {
-	return router.Resolvers{
-		"SecretID": secretIDResolver,
-		"Query": router.ObjectResolver{
-			"secret":    router.ToResolver(s.secret),
-			"setSecret": router.ToResolver(s.setSecret),
-		},
-		"Secret": router.ObjectResolver{
-			"id":        router.ToResolver(s.id),
-			"plaintext": router.ToResolver(s.plaintext),
-		},
-	}
-}
-
-func (s *secretSchema) Dependencies() []router.ExecutableSchema {
-	return nil
-}
-
-func (s *secretSchema) id(ctx *router.Context, parent *core.Secret, args any) (core.SecretID, error) {
-	return parent.ID()
-}
-
-type secretArgs struct {
-	ID core.SecretID
-}
-
-func (s *secretSchema) secret(ctx *router.Context, parent any, args secretArgs) (*core.Secret, error) {
-	return args.ID.ToSecret()
-}
-
-type SecretPlaintext string
-
-// This method ensures that the progrock vertex info does not display the plaintext.
-func (s SecretPlaintext) MarshalText() ([]byte, error) {
-	return []byte("***"), nil
+func (s *secretSchema) loadSecretFromName(ctx context.Context, parent *core.Query, args loadSecretFromNameArgs) (*core.Secret, error) {
+	return &core.Secret{
+		Query:    parent,
+		IDDigest: dagql.CurrentID(ctx).Digest(),
+	}, nil
 }
 
 type setSecretArgs struct {
 	Name      string
-	Plaintext SecretPlaintext
+	Plaintext string `sensitive:"true"` // NB: redundant with ArgSensitive above
 }
 
-func (s *secretSchema) setSecret(ctx *router.Context, parent any, args setSecretArgs) (*core.Secret, error) {
-	secretID, err := s.secrets.AddSecret(ctx, args.Name, string(args.Plaintext))
+func (s *secretSchema) setSecret(ctx context.Context, parent *core.Query, args setSecretArgs) (i dagql.Instance[*core.Secret], err error) {
+	secretStore, err := parent.Secrets(ctx)
 	if err != nil {
-		return nil, err
+		return i, fmt.Errorf("failed to get secret store: %w", err)
 	}
 
-	return secretID.ToSecret()
+	accessor, err := core.GetClientResourceAccessor(ctx, parent, args.Name)
+	if err != nil {
+		return i, fmt.Errorf("failed to get client resource name: %w", err)
+	}
+
+	// NB: to avoid putting the plaintext value in the graph, return a freshly
+	// minted Object that just gets the secret by name
+	if err := s.srv.Select(ctx, s.srv.Root(), &i, dagql.Selector{
+		Field: "loadSecretFromName",
+		Args: []dagql.NamedInput{
+			{
+				Name:  "name",
+				Value: dagql.NewString(args.Name),
+			},
+			{
+				Name:  "accessor",
+				Value: dagql.Opt(dagql.NewString(accessor)),
+			},
+		},
+	}); err != nil {
+		return i, fmt.Errorf("failed to select secret: %w", err)
+	}
+
+	if err := secretStore.AddSecret(i.Self, args.Name, []byte(args.Plaintext)); err != nil {
+		return i, fmt.Errorf("failed to add secret: %w", err)
+	}
+
+	return i, nil
 }
 
-func (s *secretSchema) plaintext(ctx *router.Context, parent *core.Secret, args any) (string, error) {
-	if parent.IsOldFormat() {
-		bytes, err := parent.LegacyPlaintext(ctx, s.gw)
-		return string(bytes), err
+type secretArgs struct {
+	URI string
+}
+
+func (s *secretSchema) secret(ctx context.Context, parent *core.Query, args secretArgs) (i dagql.Instance[*core.Secret], err error) {
+	clientMetadata, err := engine.ClientMetadataFromContext(ctx)
+	if err != nil {
+		return i, fmt.Errorf("failed to get client metadata from context: %w", err)
 	}
 
-	id, err := parent.ID()
+	secretStore, err := parent.Secrets(ctx)
+	if err != nil {
+		return i, fmt.Errorf("failed to get secret store: %w", err)
+	}
+
+	accessor, err := core.GetClientResourceAccessor(ctx, parent, args.URI)
+	if err != nil {
+		return i, fmt.Errorf("failed to get client resource name: %w", err)
+	}
+
+	// NB: to avoid putting the plaintext value in the graph, return a freshly
+	// minted Object that just gets the secret by name
+	if err := s.srv.Select(ctx, s.srv.Root(), &i, dagql.Selector{
+		Field: "loadSecretFromName",
+		Args: []dagql.NamedInput{
+			{
+				Name:  "name",
+				Value: dagql.NewString(args.URI),
+			},
+			{
+				Name:  "accessor",
+				Value: dagql.Opt(dagql.NewString(accessor)),
+			},
+		},
+	}); err != nil {
+		return i, fmt.Errorf("failed to select secret: %w", err)
+	}
+
+	if err := secretStore.NewSecret(i.Self, clientMetadata.ClientID, args.URI); err != nil {
+		return i, fmt.Errorf("failed to map secret: %w", err)
+	}
+
+	return i, nil
+}
+
+func (s *secretSchema) name(ctx context.Context, secret *core.Secret, args struct{}) (dagql.String, error) {
+	secretStore, err := secret.Query.Secrets(ctx)
+	if err != nil {
+		return "", fmt.Errorf("failed to get secret store: %w", err)
+	}
+	name, ok := secretStore.GetSecretName(secret.IDDigest)
+	if !ok {
+		return "", fmt.Errorf("secret not found: %s", secret.IDDigest)
+	}
+
+	return dagql.NewString(name), nil
+}
+
+func (s *secretSchema) uri(ctx context.Context, secret *core.Secret, args struct{}) (dagql.String, error) {
+	secretStore, err := secret.Query.Secrets(ctx)
+	if err != nil {
+		return "", fmt.Errorf("failed to get secret store: %w", err)
+	}
+	name, ok := secretStore.GetSecretURI(secret.IDDigest)
+	if !ok {
+		return "", fmt.Errorf("secret not found: %s", secret.IDDigest)
+	}
+
+	return dagql.NewString(name), nil
+}
+
+func (s *secretSchema) plaintext(ctx context.Context, secret *core.Secret, args struct{}) (dagql.String, error) {
+	secretStore, err := secret.Query.Secrets(ctx)
+	if err != nil {
+		return "", fmt.Errorf("failed to get secret store: %w", err)
+	}
+	plaintext, err := secretStore.GetSecretPlaintext(ctx, secret.IDDigest)
 	if err != nil {
 		return "", err
 	}
 
-	bytes, err := s.secrets.GetSecret(ctx, id.String())
-	if err != nil {
-		return "", err
-	}
-
-	return string(bytes), nil
+	return dagql.NewString(string(plaintext)), nil
 }

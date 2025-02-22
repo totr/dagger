@@ -1,20 +1,26 @@
+use convert_case::{Case, Casing};
 use dagger_sdk::core::introspection::FullType;
 use genco::prelude::rust;
 use genco::quote;
 use itertools::Itertools;
+
+pub fn format_name(s: &str) -> String {
+    s.to_case(Case::Pascal)
+}
 
 fn render_enum_values(values: &FullType) -> Option<rust::Tokens> {
     let values = values
         .enum_values
         .as_ref()
         .into_iter()
-        .map(|values| {
-            values
-                .into_iter()
-                .sorted_by_key(|a| &a.name)
-                .map(|val| quote! { $(val.name.as_ref()), })
+        .flat_map(|values| {
+            values.iter().sorted_by_key(|a| &a.name).map(|val| {
+                quote! {
+                    #[serde(rename = $(val.name.as_ref().map(|n| format!("\"{}\"", n))))]
+                    $(val.name.as_ref().map(|n| format_name(n))),
+                }
+            })
         })
-        .flatten()
         .collect::<Vec<_>>();
 
     let mut tokens = rust::Tokens::new();
