@@ -1,21 +1,27 @@
 package core
 
 import (
+	"context"
 	"testing"
 
-	"dagger.io/dagger"
-	"github.com/dagger/dagger/internal/engine"
+	"github.com/dagger/testctx"
+	"github.com/moby/buildkit/identity"
 	"github.com/stretchr/testify/require"
+
+	"dagger.io/dagger"
 )
 
-func TestHTTP(t *testing.T) {
-	t.Parallel()
+type HTTPSuite struct{}
 
-	c, ctx := connect(t)
-	defer c.Close()
+func TestHTTP(t *testing.T) {
+	testctx.New(t, Middleware()...).RunTests(HTTPSuite{})
+}
+
+func (HTTPSuite) TestHTTP(ctx context.Context, t *testctx.T) {
+	c := connect(ctx, t)
 
 	// do two in a row to ensure each gets downloaded correctly
-	url := "https://raw.githubusercontent.com/dagger/dagger/main/TESTING.md"
+	url := "https://raw.githubusercontent.com/dagger/dagger/main/CONTRIBUTING.md"
 	contents, err := c.HTTP(url).Contents(ctx)
 	require.NoError(t, err)
 	require.Contains(t, contents, "tests")
@@ -26,13 +32,8 @@ func TestHTTP(t *testing.T) {
 	require.Contains(t, contents, "Dagger")
 }
 
-func TestHTTPService(t *testing.T) {
-	checkNotDisabled(t, engine.ServicesDNSEnvName)
-
-	t.Parallel()
-
-	c, ctx := connect(t)
-	defer c.Close()
+func (HTTPSuite) TestHTTPService(ctx context.Context, t *testctx.T) {
+	c := connect(ctx, t)
 
 	svc, url := httpService(ctx, t, c, "Hello, world!")
 
@@ -41,4 +42,26 @@ func TestHTTPService(t *testing.T) {
 	}).Contents(ctx)
 	require.NoError(t, err)
 	require.Equal(t, contents, "Hello, world!")
+}
+
+func (HTTPSuite) TestHTTPServiceStableDigest(ctx context.Context, t *testctx.T) {
+	content := identity.NewID()
+	hostname := func(c *dagger.Client) string {
+		svc, url := httpService(ctx, t, c, content)
+
+		hn, err := c.Container().
+			From(alpineImage).
+			WithMountedFile("/index.html", c.HTTP(url, dagger.HTTPOpts{
+				ExperimentalServiceHost: svc,
+			})).
+			WithDefaultArgs([]string{"sleep"}).
+			AsService().
+			Hostname(ctx)
+		require.NoError(t, err)
+		return hn
+	}
+
+	c1 := connect(ctx, t)
+	c2 := connect(ctx, t)
+	require.Equal(t, hostname(c1), hostname(c2))
 }

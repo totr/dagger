@@ -4,6 +4,12 @@ use thiserror::Error;
 pub enum ConnectError {
     #[error("failed to connect to dagger engine")]
     FailedToConnect(#[source] eyre::Error),
+
+    #[error("an error occurred from the dagger context call")]
+    DaggerContext(#[source] eyre::Error),
+
+    #[error("failed to shutdown the dagger connection")]
+    FailedToShutdown(#[source] eyre::Error),
 }
 
 #[derive(Error, Debug)]
@@ -16,6 +22,8 @@ pub enum DaggerError {
     Query(#[source] crate::core::graphql_client::GraphQLError),
     #[error("failed to unpack response")]
     Unpack(#[source] DaggerUnpackError),
+    #[error("failed to download client")]
+    DownloadClient(#[source] eyre::Error),
 }
 
 #[derive(Error, Debug)]

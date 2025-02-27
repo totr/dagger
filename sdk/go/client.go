@@ -1,22 +1,22 @@
-//go:generate client-gen -o api.gen.go --package dagger --lang go
 package dagger
 
 import (
 	"context"
 	"io"
 
-	"dagger.io/dagger/internal/engineconn"
-	"dagger.io/dagger/internal/querybuilder"
 	"github.com/Khan/genqlient/graphql"
 	"github.com/vektah/gqlparser/v2/gqlerror"
+
+	"dagger.io/dagger/engineconn"
+	"dagger.io/dagger/querybuilder"
 )
 
 // Client is the Dagger Engine Client
 type Client struct {
 	conn engineconn.EngineConn
-	c    graphql.Client
 
-	q *querybuilder.Selection
+	query  *querybuilder.Selection
+	client graphql.Client
 }
 
 // ClientOpt holds a client option
@@ -51,14 +51,44 @@ func WithConn(conn engineconn.EngineConn) ClientOpt {
 	})
 }
 
-// Connect to a Dagger Engine
-func Connect(ctx context.Context, opts ...ClientOpt) (_ *Client, rerr error) {
-	defer func() {
-		if rerr != nil {
-			rerr = withErrorHelp(rerr)
-		}
-	}()
+// WithVersionOverride requests a specific schema version from the engine.
+// Calling this may cause the schema to be out-of-sync from the codegen - this
+// option is likely *not* desirable for most use cases.
+//
+// This only has effect when connecting via the CLI, and is only exposed for
+// testing purposes.
+func WithVersionOverride(version string) ClientOpt {
+	return clientOptFunc(func(cfg *engineconn.Config) {
+		cfg.VersionOverride = version
+	})
+}
 
+// WithVerbosity sets the verbosity level for the progress output
+func WithVerbosity(level int) ClientOpt {
+	return clientOptFunc(func(cfg *engineconn.Config) {
+		cfg.Verbosity = level
+	})
+}
+
+// WithRunnerHost sets the runner host URL for provisioning and connecting to
+// an engine.
+//
+// This only has effect when connecting via the CLI, and is only exposed for
+// testing purposes.
+func WithRunnerHost(runnerHost string) ClientOpt {
+	return clientOptFunc(func(cfg *engineconn.Config) {
+		cfg.RunnerHost = runnerHost
+	})
+}
+
+func WithServeCurrentModule(serveCurrentModule bool) ClientOpt {
+	return clientOptFunc(func(cfg *engineconn.Config) {
+		cfg.ServeCurrentModule = serveCurrentModule
+	})
+}
+
+// Connect to a Dagger Engine
+func Connect(ctx context.Context, opts ...ClientOpt) (*Client, error) {
 	cfg := &engineconn.Config{}
 
 	for _, o := range opts {
@@ -71,11 +101,21 @@ func Connect(ctx context.Context, opts ...ClientOpt) (_ *Client, rerr error) {
 	}
 	gql := errorWrappedClient{graphql.NewClient("http://"+conn.Host()+"/query", conn)}
 
-	return &Client{
-		c:    gql,
-		conn: conn,
-		q:    querybuilder.Query(),
-	}, nil
+	c := &Client{
+		query:  querybuilder.Query().Client(gql),
+		client: gql,
+		conn:   conn,
+	}
+	return c, nil
+}
+
+// GraphQLClient returns the underlying graphql.Client
+func (c *Client) GraphQLClient() graphql.Client {
+	return c.client
+}
+
+func (c *Client) QueryBuilder() *querybuilder.Selection {
+	return c.query
 }
 
 // Close the engine connection
@@ -94,7 +134,7 @@ func (c *Client) Do(ctx context.Context, req *Request, resp *Response) error {
 		r.Errors = resp.Errors
 		r.Extensions = resp.Extensions
 	}
-	return c.c.MakeRequest(ctx, &graphql.Request{
+	return c.client.MakeRequest(ctx, &graphql.Request{
 		Query:     req.Query,
 		Variables: req.Variables,
 		OpName:    req.OpName,
@@ -145,11 +185,10 @@ type errorWrappedClient struct {
 func (c errorWrappedClient) MakeRequest(ctx context.Context, req *graphql.Request, resp *graphql.Response) error {
 	err := c.Client.MakeRequest(ctx, req, resp)
 	if err != nil {
-		// return custom error without wrapping to enable casting
 		if e := getCustomError(err); e != nil {
 			return e
 		}
-		return withErrorHelp(err)
+		return err
 	}
 	return nil
 }

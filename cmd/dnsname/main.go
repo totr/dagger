@@ -120,7 +120,12 @@ func cmdDel(args *skel.CmdArgs) error {
 }
 
 func main() {
-	skel.PluginMain(cmdAdd, cmdCheck, cmdDel, version.All, getVersion())
+	cniFuncs := skel.CNIFuncs{
+		Add:   cmdAdd,
+		Check: cmdCheck,
+		Del:   cmdDel,
+	}
+	skel.PluginMainFuncs(cniFuncs, version.All, getVersion())
 }
 
 func cmdCheck(args *skel.CmdArgs) error {
@@ -153,7 +158,7 @@ func cmdCheck(args *skel.CmdArgs) error {
 
 type podname struct {
 	types.CommonArgs
-	K8S_POD_NAME types.UnmarshallableString `json:"podname,omitempty"` //nolint:revive,stylecheck
+	K8S_POD_NAME types.UnmarshallableString `json:"podname,omitempty"` //nolint:stylecheck
 }
 
 // parseConfig parses the supplied configuration (and prevResult) from stdin.

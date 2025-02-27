@@ -2,182 +2,172 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 
-	tea "github.com/charmbracelet/bubbletea"
+	"dagger.io/dagger/telemetry"
+	"github.com/dagger/dagger/dagql/dagui"
 	"github.com/dagger/dagger/engine"
-	internalengine "github.com/dagger/dagger/internal/engine"
-	"github.com/dagger/dagger/internal/tui"
-	"github.com/dagger/dagger/router"
-	"github.com/mattn/go-isatty"
-	"github.com/vito/progrock"
+	"github.com/dagger/dagger/engine/client"
+	"github.com/dagger/dagger/engine/distconsts"
+	"github.com/dagger/dagger/engine/slog"
+	enginetel "github.com/dagger/dagger/engine/telemetry"
+	sdklog "go.opentelemetry.io/otel/sdk/log"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
 
-var silent bool
-var stdoutIsTTY = isatty.IsTerminal(os.Stdout.Fd())
-var stderrIsTTY = isatty.IsTerminal(os.Stderr.Fd())
+const (
+	GPUSupportEnv = "_EXPERIMENTAL_DAGGER_GPU_SUPPORT"
+	RunnerHostEnv = "_EXPERIMENTAL_DAGGER_RUNNER_HOST"
+)
+
+var (
+	// RunnerHost holds the host to connect to.
+	//
+	// Note: this is filled at link-time.
+	RunnerHost string
+)
 
 func init() {
-	rootCmd.PersistentFlags().BoolVarP(
-		&silent,
-		"silent",
-		"s",
-		!stdoutIsTTY && !stderrIsTTY,
-		"disable terminal UI and progress output",
-	)
+	if v, ok := os.LookupEnv(RunnerHostEnv); ok {
+		RunnerHost = v
+	}
+	if RunnerHost == "" {
+		RunnerHost = defaultRunnerHost()
+	}
 }
 
-var interactive = os.Getenv("_EXPERIMENTAL_DAGGER_INTERACTIVE_TUI") != ""
+func defaultRunnerHost() string {
+	tag := engine.Tag
+	if tag == "" {
+		// can happen during naive dev builds (so just fallback to something
+		// semi-reasonable)
+		return "docker-container://" + distconsts.EngineContainerName
+	}
+	if os.Getenv(GPUSupportEnv) != "" {
+		tag += "-gpu"
+	}
+	return fmt.Sprintf("docker-image://%s:%s", engine.EngineImageRepo, tag)
+}
 
-func withEngineAndTUI(
+type runClientCallback func(context.Context, *client.Client) error
+
+func withEngine(
 	ctx context.Context,
-	engineConf engine.Config,
-	fn engine.StartCallback,
+	params client.Params,
+	fn runClientCallback,
 ) error {
-	if engineConf.Workdir == "" {
-		engineConf.Workdir = workdir
-	}
+	return Frontend.Run(ctx, opts, func(ctx context.Context) (rerr error) {
+		// Init tracing as early as possible and shutdown after the command
+		// completes, ensuring progress is fully flushed to the frontend.
+		ctx, cleanupTelemetry := initEngineTelemetry(ctx)
+		defer func() { cleanupTelemetry(rerr) }()
 
-	if engineConf.RunnerHost == "" {
-		engineConf.RunnerHost = internalengine.RunnerHost()
-	}
-
-	engineConf.DisableHostRW = disableHostRW
-
-	if engineConf.JournalFile == "" {
-		engineConf.JournalFile = os.Getenv("_EXPERIMENTAL_DAGGER_JOURNAL")
-	}
-
-	if silent {
-		if engineConf.LogOutput == nil {
-			engineConf.LogOutput = os.Stderr
+		if debug {
+			params.LogLevel = slog.LevelDebug
 		}
 
-		return engine.Start(ctx, engineConf, fn)
-	}
+		if params.RunnerHost == "" {
+			params.RunnerHost = RunnerHost
+		}
 
-	if interactive {
-		return interactiveTUI(ctx, engineConf, fn)
-	}
+		params.DisableHostRW = disableHostRW
 
-	return inlineTUI(ctx, engineConf, fn)
-}
+		params.EngineCallback = Frontend.ConnectedToEngine
+		params.CloudURLCallback = Frontend.SetCloudURL
 
-func progrockTee(progW progrock.Writer) (progrock.Writer, error) {
-	if log := os.Getenv("_EXPERIMENTAL_DAGGER_PROGROCK_JOURNAL"); log != "" {
-		fileW, err := newProgrockWriter(log)
+		params.EngineTrace = telemetry.SpanForwarder{
+			Processors: telemetry.SpanProcessors,
+		}
+		params.EngineLogs = telemetry.LogForwarder{
+			Processors: telemetry.LogProcessors,
+		}
+		params.EngineMetrics = telemetry.MetricExporters
+
+		params.WithTerminal = withTerminal
+		params.Interactive = interactive
+		params.InteractiveCommand = interactiveCommandParsed
+
+		// Connect to and run with the engine
+		sess, ctx, err := client.Connect(ctx, params)
 		if err != nil {
-			return nil, fmt.Errorf("open progrock log: %w", err)
+			return err
+		}
+		defer sess.Close()
+
+		// Automatically serve the module in the context directory if available.
+		if params.ServeModule {
+			mod, exist, err := initializeClientGeneratorModule(ctx, sess.Dagger(), ".")
+			if err != nil && !errors.Is(err, ErrConfigNotFound) {
+				return fmt.Errorf("failed to initialize current module: %w", err)
+			}
+
+			if exist {
+				for _, dep := range mod.Dependencies {
+					err := dep.AsModule().Serve(ctx)
+					if err != nil {
+						return fmt.Errorf("failed to serve dependency %w", err)
+					}
+				}
+
+				sdkSource, err := mod.Source.SDK().Source(ctx)
+				if err != nil {
+					return fmt.Errorf("failed to get module SDK source: %w", err)
+				}
+
+				if sdkSource != "" {
+					err := mod.Source.AsModule().Serve(ctx)
+					if err != nil {
+						return fmt.Errorf("failed to serve module source: %w", err)
+					}
+				}
+			}
 		}
 
-		return progrock.MultiWriter{progW, fileW}, nil
-	}
-
-	return progW, nil
-}
-
-func interactiveTUI(
-	ctx context.Context,
-	engineConf engine.Config,
-	fn engine.StartCallback,
-) error {
-	progR, progW := progrock.Pipe()
-	progW, err := progrockTee(progW)
-	if err != nil {
-		return err
-	}
-
-	engineConf.ProgrockWriter = progW
-
-	ctx, quit := context.WithCancel(ctx)
-	defer quit()
-
-	program := tea.NewProgram(tui.New(quit, progR), tea.WithAltScreen())
-
-	tuiDone := make(chan error, 1)
-	go func() {
-		_, err := program.Run()
-		tuiDone <- err
-	}()
-
-	var cbErr error
-	engineErr := engine.Start(ctx, engineConf, func(ctx context.Context, api *router.Router) error {
-		cbErr = fn(ctx, api)
-		return cbErr
+		return fn(ctx, sess)
 	})
-
-	tuiErr := <-tuiDone
-
-	if cbErr != nil {
-		// avoid unnecessary error wrapping
-		return cbErr
-	}
-
-	return errors.Join(tuiErr, engineErr)
 }
 
-func inlineTUI(
-	ctx context.Context,
-	engineConf engine.Config,
-	fn engine.StartCallback,
-) error {
-	tape := progrock.NewTape()
-	if debug {
-		tape.ShowInternal(true)
+func initEngineTelemetry(ctx context.Context) (context.Context, func(error)) {
+	// Setup telemetry config
+	telemetryCfg := telemetry.Config{
+		Detect:   true,
+		Resource: Resource(ctx),
+
+		LiveTraceExporters:  []sdktrace.SpanExporter{Frontend.SpanExporter()},
+		LiveLogExporters:    []sdklog.Exporter{Frontend.LogExporter()},
+		LiveMetricExporters: []sdkmetric.Exporter{Frontend.MetricExporter()},
 	}
-
-	progW, engineErr := progrockTee(tape)
-	if engineErr != nil {
-		return engineErr
+	if spans, logs, metrics, ok := enginetel.ConfiguredCloudExporters(ctx); ok {
+		telemetryCfg.LiveTraceExporters = append(telemetryCfg.LiveTraceExporters, spans)
+		telemetryCfg.LiveLogExporters = append(telemetryCfg.LiveLogExporters, logs)
+		telemetryCfg.LiveMetricExporters = append(telemetryCfg.LiveMetricExporters, metrics)
 	}
+	ctx = telemetry.Init(ctx, telemetryCfg)
 
-	engineConf.ProgrockWriter = progW
+	// Set the full command string as the name of the root span.
+	//
+	// If you pass credentials in plaintext, yes, they will be leaked; don't do
+	// that, since they will also be leaked in various other places (like the
+	// process tree). Use Secret arguments instead.
+	ctx, span := Tracer().Start(ctx, spanName(os.Args))
 
-	ctx, quit := context.WithCancel(ctx)
-	defer quit()
+	// Set up global slog to log to the primary span output.
+	slog.SetDefault(slog.SpanLogger(ctx, InstrumentationLibrary))
 
-	stop := progrock.DefaultUI().RenderLoop(quit, tape, os.Stderr, true)
-	defer stop()
+	// Set the span as the primary span for the frontend.
+	Frontend.SetPrimary(dagui.SpanID{SpanID: span.SpanContext().SpanID()})
 
-	var cbErr error
-	engineErr = engine.Start(ctx, engineConf, func(ctx context.Context, api *router.Router) error {
-		cbErr = fn(ctx, api)
-		return cbErr
-	})
-	if cbErr != nil {
-		return cbErr
+	// Direct command stdout/stderr to span stdio via OpenTelemetry.
+	stdio := telemetry.SpanStdio(ctx, InstrumentationLibrary)
+	rootCmd.SetOut(stdio.Stdout)
+	rootCmd.SetErr(stdio.Stderr)
+
+	return ctx, func(rerr error) {
+		stdio.Close()
+		telemetry.End(span, func() error { return rerr })
+		telemetry.Close()
 	}
-
-	return engineErr
-}
-
-func newProgrockWriter(dest string) (progrock.Writer, error) {
-	f, err := os.Create(dest)
-	if err != nil {
-		return nil, err
-	}
-
-	return progrockFileWriter{
-		enc: json.NewEncoder(f),
-		c:   f,
-	}, nil
-}
-
-type progrockFileWriter struct {
-	enc *json.Encoder
-	c   io.Closer
-}
-
-var _ progrock.Writer = progrockFileWriter{}
-
-func (p progrockFileWriter) WriteStatus(update *progrock.StatusUpdate) error {
-	return p.enc.Encode(update)
-}
-
-func (p progrockFileWriter) Close() error {
-	return p.c.Close()
 }

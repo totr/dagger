@@ -2,15 +2,17 @@ use std::{
     fs::File,
     io::{copy, Write},
     os::unix::prelude::PermissionsExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use eyre::Context;
 use flate2::read::GzDecoder;
-use platform_info::Uname;
+use platform_info::{PlatformInfoAPI, UNameAPI};
 use sha2::Digest;
 use tar::Archive;
 use tempfile::tempfile;
+
+use crate::errors::DaggerError;
 
 #[allow(dead_code)]
 #[derive(Clone)]
@@ -20,10 +22,11 @@ pub struct Platform {
 }
 
 impl Platform {
-    pub fn from_system() -> eyre::Result<Self> {
-        let platform = platform_info::PlatformInfo::new()?;
-        let os_name = platform.sysname();
-        let arch = platform.machine().to_lowercase();
+    pub fn from_system() -> Platform {
+        let platform = platform_info::PlatformInfo::new()
+            .expect("Unable to determine platform information, use `dagger run <app> instead`");
+        let os_name = platform.sysname().to_string_lossy().to_lowercase();
+        let arch = platform.machine().to_string_lossy().to_lowercase();
         let normalize_arch = match arch.as_str() {
             "x86_64" => "amd64",
             "aarch" => "arm64",
@@ -31,10 +34,10 @@ impl Platform {
             arch => arch,
         };
 
-        Ok(Self {
-            os: os_name.to_lowercase(),
+        Self {
+            os: os_name,
             arch: normalize_arch.into(),
-        })
+        }
     }
 }
 
@@ -47,16 +50,15 @@ pub struct TempFile {
 
 #[allow(dead_code)]
 impl TempFile {
-    pub fn new(prefix: &str, directory: &PathBuf) -> eyre::Result<Self> {
+    pub fn new(prefix: &str, directory: &Path) -> eyre::Result<Self> {
         let prefix = prefix.to_string();
-        let directory = directory.clone();
 
         let file = tempfile()?;
 
         Ok(Self {
             prefix,
-            directory,
             file,
+            directory: directory.to_path_buf(),
         })
     }
 }
@@ -78,11 +80,11 @@ const CLI_BASE_URL: &str = "https://dl.dagger.io/dagger/releases";
 
 #[allow(dead_code)]
 impl Downloader {
-    pub fn new(version: CliVersion) -> eyre::Result<Self> {
-        Ok(Self {
+    pub fn new(version: CliVersion) -> Self {
+        Self {
             version,
-            platform: Platform::from_system()?,
-        })
+            platform: Platform::from_system(),
+        }
     }
 
     pub fn archive_url(&self) -> String {
@@ -120,9 +122,9 @@ impl Downloader {
         Ok(path)
     }
 
-    pub async fn get_cli(&self) -> eyre::Result<PathBuf> {
+    pub async fn get_cli(&self) -> Result<PathBuf, DaggerError> {
         let version = &self.version;
-        let mut cli_bin_path = self.cache_dir()?;
+        let mut cli_bin_path = self.cache_dir().map_err(DaggerError::DownloadClient)?;
         cli_bin_path.push(format!("{CLI_BIN_PREFIX}{version}"));
         if self.platform.os == "windows" {
             cli_bin_path = cli_bin_path.with_extension("exe")
@@ -132,7 +134,8 @@ impl Downloader {
             cli_bin_path = self
                 .download(cli_bin_path)
                 .await
-                .context("failed to download CLI from archive")?;
+                .context("failed to download CLI from archive")
+                .map_err(DaggerError::DownloadClient)?;
         }
 
         Ok(cli_bin_path)
@@ -145,7 +148,7 @@ impl Downloader {
         let actual_hash = self.extract_cli_archive(&mut bytes).await?;
 
         if expected_checksum != actual_hash {
-            eyre::bail!("downloaded CLI binary checksum doesn't match checksum from checksums.txt")
+            eyre::bail!("downloaded CLI binary checksum: {actual_hash} doesn't match checksum from checksums.txt: {expected_checksum}")
         }
 
         let mut file = std::fs::File::create(&path)?;
@@ -227,11 +230,7 @@ mod test {
 
     #[tokio::test]
     async fn download() {
-        let cli_path = Downloader::new("0.3.10".into())
-            .unwrap()
-            .get_cli()
-            .await
-            .unwrap();
+        let cli_path = Downloader::new("0.3.10".into()).get_cli().await.unwrap();
 
         assert_eq!(
             Some("dagger-0.3.10"),

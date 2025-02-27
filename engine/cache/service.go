@@ -3,7 +3,6 @@ package cache
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -110,7 +109,6 @@ func (r UpdateCacheRecordsRequest) String() string {
 	return string(b)
 }
 
-//nolint:revive
 type CacheKey struct {
 	ID      string
 	Results []Result
@@ -180,6 +178,7 @@ type GetLayerUploadURLRequest struct {
 type GetLayerUploadURLResponse struct {
 	URL     string
 	Headers map[string]string
+	Skip    bool
 }
 
 type GetCacheMountConfigRequest struct{}
@@ -205,6 +204,7 @@ type GetCacheMountUploadURLRequest struct {
 type GetCacheMountUploadURLResponse struct {
 	URL     string
 	Headers map[string]string
+	Skip    bool
 }
 
 type client struct {
@@ -270,8 +270,8 @@ func (c *client) GetConfig(ctx context.Context, req GetConfigRequest) (*Config, 
 		return nil, err
 	}
 	defer httpResp.Body.Close()
-	if httpResp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d", httpResp.StatusCode)
+	if err := checkResponse(httpResp); err != nil {
+		return nil, err
 	}
 
 	config := &Config{}
@@ -309,8 +309,8 @@ func (c *client) UpdateCacheRecords(
 		return nil, err
 	}
 	defer httpResp.Body.Close()
-	if httpResp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d", httpResp.StatusCode)
+	if err := checkResponse(httpResp); err != nil {
+		return nil, err
 	}
 
 	resp := &UpdateCacheRecordsResponse{}
@@ -320,7 +320,6 @@ func (c *client) UpdateCacheRecords(
 	return resp, nil
 }
 
-//nolint:dupl
 func (c *client) UpdateCacheLayers(
 	ctx context.Context,
 	req UpdateCacheLayersRequest,
@@ -348,14 +347,13 @@ func (c *client) UpdateCacheLayers(
 		return err
 	}
 	defer httpResp.Body.Close()
-	if httpResp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status code: %d", httpResp.StatusCode)
+	if err := checkResponse(httpResp); err != nil {
+		return err
 	}
 
 	return nil
 }
 
-//nolint:dupl
 func (c *client) ImportCache(ctx context.Context) (*remotecache.CacheConfig, error) {
 	httpReq, err := http.NewRequestWithContext(ctx, "GET", c.baseURL+"/import", nil)
 	if err != nil {
@@ -370,8 +368,8 @@ func (c *client) ImportCache(ctx context.Context) (*remotecache.CacheConfig, err
 		return nil, err
 	}
 	defer httpResp.Body.Close()
-	if httpResp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d", httpResp.StatusCode)
+	if err := checkResponse(httpResp); err != nil {
+		return nil, err
 	}
 
 	config := &remotecache.CacheConfig{}
@@ -406,8 +404,8 @@ func (c *client) GetLayerDownloadURL(ctx context.Context, req GetLayerDownloadUR
 		return nil, err
 	}
 	defer httpResp.Body.Close()
-	if httpResp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d", httpResp.StatusCode)
+	if err := checkResponse(httpResp); err != nil {
+		return nil, err
 	}
 
 	resp := &GetLayerDownloadURLResponse{}
@@ -442,8 +440,8 @@ func (c *client) GetLayerUploadURL(ctx context.Context, req GetLayerUploadURLReq
 		return nil, err
 	}
 	defer httpResp.Body.Close()
-	if httpResp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d", httpResp.StatusCode)
+	if err := checkResponse(httpResp); err != nil {
+		return nil, err
 	}
 
 	resp := &GetLayerUploadURLResponse{}
@@ -478,8 +476,8 @@ func (c *client) GetCacheMountConfig(ctx context.Context, req GetCacheMountConfi
 		return nil, err
 	}
 	defer httpResp.Body.Close()
-	if httpResp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d", httpResp.StatusCode)
+	if err := checkResponse(httpResp); err != nil {
+		return nil, err
 	}
 
 	resp := &GetCacheMountConfigResponse{}
@@ -514,8 +512,8 @@ func (c *client) GetCacheMountUploadURL(ctx context.Context, req GetCacheMountUp
 		return nil, err
 	}
 	defer httpResp.Body.Close()
-	if httpResp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d", httpResp.StatusCode)
+	if err := checkResponse(httpResp); err != nil {
+		return nil, err
 	}
 
 	resp := &GetCacheMountUploadURLResponse{}

@@ -1,41 +1,53 @@
 defmodule Dagger.MixProject do
   use Mix.Project
 
-  @version "0.2.0-dev"
+  @version "0.0.0"
   @source_url "https://github.com/dagger/dagger"
 
   def project do
     [
-      app: :dagger_ex,
+      app: :dagger,
       version: @version,
       elixir: "~> 1.14",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       package: package(),
-      docs: docs()
+      docs: docs(),
+      aliases: aliases(),
+      elixirc_paths: elixirc_paths(Mix.env())
     ]
   end
 
   def application do
     [
-      extra_applications: [:logger]
+      extra_applications: [:logger, :public_key, :ssl, :inets]
     ]
   end
 
   defp deps do
     [
-      {:req, "~> 0.3"},
-      {:absinthe_client, "~> 0.1"},
+      {:jason, "~> 1.4"},
       {:nimble_options, "~> 1.0"},
-      {:ex_doc, "~> 0.27", only: :dev, runtime: false}
+      {:nestru, "~> 1.0"},
+      {:ex_doc, "~> 0.27", only: :dev, runtime: false},
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
     ]
   end
 
+  defp aliases do
+    [
+      lint: ["format --check-formatted", "credo"]
+    ]
+  end
+
+  defp elixirc_paths(:test), do: ["lib", "test/support"]
+  defp elixirc_paths(_), do: ["lib"]
+
   defp package do
     %{
-      name: "dagger_ex",
+      name: "dagger",
       description: "Dagger SDK for Elixir",
-      licenses: ["MIT"],
+      licenses: ["Apache-2.0"],
       links: %{
         "GitHub" => @source_url,
         "Changelog" => "#{@source_url}/releases/tag/sdk%2Felixir%2Fv#{@version}"
@@ -47,8 +59,7 @@ defmodule Dagger.MixProject do
     [
       source_ref: "v#{@version}",
       source_url: @source_url,
-      main: "Dagger",
-      extras: ["getting_started.livemd"]
+      main: "Dagger"
     ]
   end
 end

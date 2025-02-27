@@ -11,6 +11,8 @@ import (
 	bkgw "github.com/moby/buildkit/frontend/gateway/client"
 	"github.com/moby/buildkit/solver/pb"
 	fstypes "github.com/tonistiigi/fsutil/types"
+
+	"github.com/dagger/dagger/engine/buildkit"
 )
 
 type FS struct {
@@ -22,17 +24,17 @@ func ReferenceFS(ctx context.Context, ref bkgw.Reference) fs.FS {
 	return &FS{ctx: ctx, ref: ref}
 }
 
-func OpenState(ctx context.Context, gw bkgw.Client, st llb.State, opts ...llb.ConstraintsOpt) (fs.FS, error) {
+func OpenState(ctx context.Context, bk *buildkit.Client, st llb.State, opts ...llb.ConstraintsOpt) (fs.FS, error) {
 	def, err := st.Marshal(ctx, opts...)
 	if err != nil {
 		return nil, err
 	}
 
-	return OpenDef(ctx, gw, def.ToPB())
+	return OpenDef(ctx, bk, def.ToPB())
 }
 
-func OpenDef(ctx context.Context, gw bkgw.Client, def *pb.Definition) (fs.FS, error) {
-	res, err := gw.Solve(ctx, bkgw.SolveRequest{
+func OpenDef(ctx context.Context, bk *buildkit.Client, def *pb.Definition) (fs.FS, error) {
+	res, err := bk.Solve(ctx, bkgw.SolveRequest{
 		Definition: def,
 		Evaluate:   true,
 	})
